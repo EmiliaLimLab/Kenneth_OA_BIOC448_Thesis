@@ -1,5 +1,5 @@
-**To run our analysis:**  
-In order to replicate our work, one must get permissions from CLSA, CANUE, and Abacus for the starting files.
+**Obtain starting files:**  
+In order to replicate our work, one must get permissions from CLSA, CANUE, and Abacus for the files we used.
 Please Follow these pages to get data permissions:
   * https://www.canuedata.ca/metadata.php  (aqaix_ava_12.csv, aqaix_ava_13.csv, aqaix_ava_14.csv)
   * https://www.clsa-elcv.ca/data-access/ (clinical and epigenetic data)
