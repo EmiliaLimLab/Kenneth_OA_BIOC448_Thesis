@@ -1,0 +1,12 @@
+"0","## Arrange forest plots into a single figure
+merged_gene_forest_plots <- ggarrange(forest_plot_genes_pm,
+                                          forest_plot_genes_no2,
+                                          forest_plot_genes_o3,
+                                          forest_plot_genes_so2,
+                                          forest_plot_genes_mp,
+                                          labels = c(""A"", ""B"", ""C"", ""D"", ""E""),
+                                          ncol = 1, nrow = 5, 
+                                          heights = c(0.7))
+"
+"2","Error: object 'forest_plot_genes_mp' not found
+"

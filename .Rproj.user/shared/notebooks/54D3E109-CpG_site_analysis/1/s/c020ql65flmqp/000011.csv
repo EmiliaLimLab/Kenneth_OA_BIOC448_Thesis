@@ -1,0 +1,5 @@
+"0","clinical_table <- fread(""/projects/lim_lab/datasets/CLSA/2401026_UBC_ELim_BL/2401026_UBC_ELim_Baseline_CoPv7.csv"")
+"
+"2","Error in fread(""/projects/lim_lab/datasets/CLSA/2401026_UBC_ELim_BL/2401026_UBC_ELim_Baseline_CoPv7.csv"") : 
+  File '/projects/lim_lab/datasets/CLSA/2401026_UBC_ELim_BL/2401026_UBC_ELim_Baseline_CoPv7.csv' does not exist or is non-readable. getwd()=='C:/Users/Knock/Documents/Personal/School/2024_2025_Session/BIOC_448/Bioc_448_analysis_view_only'
+"

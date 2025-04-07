@@ -1,0 +1,2538 @@
+---
+title: "Kenneth_BIOC_448_Thesis"
+author: "Kenneth Ofori-Amanfo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Package Library
+```{r}
+library(BiocManager)
+library(dplyr)
+library(data.table) 
+library(tidyverse)
+library(ggplot2)
+library(pacman)
+library(broom)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(bumphunter)
+library(minfi)
+library(qqman)
+p_load(dplyr,doMC)
+library(paletteer)
+library(ggrepel)
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(methylGSA)
+library(lme4)
+library(lmerTest)
+library(ggpubr)
+library(ggmagnify)
+```
+
+## Preparing the Starting Files for Analysis
+
+### Import external files
+```{r}
+clinical_table <- fread("UBC_ELim_Baseline_CoPv7.csv")
+
+epigenetic_table <- fread("CLSA.Preprocessed_Betas_Transposed_Apr2021.csv")
+
+## The CSd
+pccf_file <- read.delim("PCCF_FCCP_V2409_2021.txt",
+                        header = FALSE)
+```
+
+### Obtain 3 year average of CANUE's multi-pollutant score
+```{r}
+mp_2012 <- fread("aqaix_ava_12.csv")
+mp_2013 <- fread("aqaix_ava_13.csv")
+mp_2014 <- fread("aqaix_ava_14.csv")
+
+## merge the yearly average tables into a single one by their postal codes
+canue_csd_data <- left_join(mp_2012, mp_2013, 
+                            by = c("postalcode12" = "postalcode13")) %>%
+  left_join(., mp_2014, by=c("postalcode12" = "postalcode14")) %>%
+  ## turn -9999 inputs to NA values
+  mutate(aqaix12_01 = replace(aqaix12_01, which(aqaix12_01 < 0), NA)) %>%
+  mutate(aqaix13_01 = replace(aqaix13_01, which(aqaix13_01 < 0), NA)) %>%
+  mutate(aqaix14_01 = replace(aqaix14_01, which(aqaix14_01 < 0), NA)) %>%
+  mutate(avg_mp = rowMeans(cbind(aqaix12_01, aqaix13_01, aqaix14_01), 
+                           na.rm = TRUE)) %>%
+  mutate(avg_mp = replace(avg_mp, which (is.nan(avg_mp)), NA))
+```
+
+### Get the mode multi-pollutant score for each CSD
+```{r}
+##-----------------------------------------------------------------------------
+## use the PCCF file get get the Mode of postal codes in CSD
+
+## From the pccf file, everything is in a single column. Must separate based
+## on character position
+# create a column for postal_code
+pccf_file$postal_code <- substr(pccf_file$V1,1,6)
+pccf_file$csd_id <- as.integer(substr(pccf_file$V1,16,22))
+
+## Add the CSD to each row in to the canue data
+
+canue_csd_data <- left_join(canue_csd_data, pccf_file, 
+                            by=c("postalcode12" = "postal_code"))
+
+## For each CSD we are going to take the Mode
+## https://dplyr.tidyverse.org/reference/group_by.html
+## https://www.tutorialspoint.com/r/r_mean_median_mode.htm
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]}
+
+canue_csd_data <- canue_csd_data %>% group_by(csd_id) %>%
+  summarise(
+    getmode(avg_mp))
+```
+
+### Shorten clinical data to relevant information for analysis and add multi-pollutant score
+```{r}
+## Joining CSD_CANUE data to CLSA
+clinical_data_mp <- clinical_table[,c("ADM_EPIGEN2_COM", "SEX_ASK_COM",
+                                      "AGE_NMBR_COM", "SDC_ETHN_OTSP01_COM",
+                                      "SDC_ETHN_OTSP02_COM", "ED_HSGR_COM",
+                                      "SMK_CURRCG_COM", "SMK_OTCURR_CA_COM",
+                                      "ALC_FREQ_COM", "HWT_DISW_COM",
+                                      "HWT_DBMI_COM","BLD_WBC_COM",
+                                      "INC_TOT_COM","pm25_1yr_com",
+                                      "o3_exp_com", "no2_exp_com",
+                                      "so2_exp_com","MSDYY_CSD_COM",
+                                      "pm25_exp_com")] %>%
+  left_join(. , canue_csd_data, by=c("MSDYY_CSD_COM" = "csd_id")) 
+colnames(clinical_data_mp)[20] <- "multipollutant_exp"
+```
+
+## Summary of Cohort Stats
+Characterization | Summary
+-----------------|---------------
+N                |1445
+Female (%)       |51
+Age (years)      |62.99 (± 10.30)
+BMI(%)           |
+  Underweight    |1
+  Normal         |27
+  Overweight     |40
+  Obese Class I  |21
+  Obese Class II |7
+  Obese CLass III|4
+Alcohol Consumption (%)|
+  Never          |13
+  Occassinally   |42
+  Frequently     |45
+Smoking Status (%)| 
+  Non-Smoker    |84
+  Occasional Smoker|3
+  Daily Smoker   |13
+High School Graduate (%)|95
+Income (%)
+  < $20,000      |7
+  From 20,000  50,000 |26
+  From 50,000 to 100,000|32
+  From 100,000 to 150,000|18
+  150,000 or more|17
+PM2.5 exposure (ug/m^3)|6.59 (± 3.81)
+NO2 (ug/m^3)|17.42 (± 11.36)
+O3(ug/m^3)|46.90 (± 17.63)
+SO2 (ug/m^3)|2.43 (± 3.73)
+Multi-pollutant score| 25.19 (± 9.30)
+
+```{r}
+## Reduce Clinical data to have only information on those with epigenetic data
+participant_data <- clinical_data_mp
+participant_data <- participant_data[participant_data$ADM_EPIGEN2_COM %in% as.integer(epigenetic_table[[1]]),] 
+
+## ----------------------------------------------------------------------------------
+### Age of participants
+mean(participant_data$AGE_NMBR_COM)
+sd(participant_data$AGE_NMBR_COM)
+
+#                           mean: 62.99 years of age       sd: 10.30
+
+## ----------------------------------------------------------------------------------
+### Sex of participants
+percent_male <- participant_data[!is.na(participant_data$SEX_ASK_COM),] %>%
+  summarise(proportion = sum(SEX_ASK_COM == "M") / n())
+
+
+#                           Male: 49% Female: 51%
+
+## ----------------------------------------------------------------------------------
+### High School Diploma?
+has_hs_diploma <- participant_data[!is.na(participant_data$ED_HSGR_COM),] %>%
+  .[.$ED_HSGR_COM <= 2,] %>%
+    summarise(proportion = sum(ED_HSGR_COM == 1) / n())
+
+## 95% have graduated high school
+
+## ----------------------------------------------------------------------------------
+### Alcohol Frequency: Total participants without NA value: 1442
+## Frequent alcohol consumption (2-3 times a week or more): 45% participants
+nrow(participant_data[participant_data$ALC_FREQ_COM <= 3]) / 
+  nrow(participant_data[!is.na(participant_data$ALC_FREQ_COM)])
+## Occasional alcohol consumption (once a week to <1 a month): 42% participants
+nrow(participant_data[participant_data$ALC_FREQ_COM <= 7 &
+                                       participant_data$ALC_FREQ_COM >= 4])/
+  nrow(participant_data[!is.na(participant_data$ALC_FREQ_COM)])
+## Zero alcohol consumption (never) : 13% participants
+nrow(participant_data[participant_data$ALC_FREQ_COM == 96])/
+  nrow(participant_data[!is.na(participant_data$ALC_FREQ_COM)])
+
+
+
+## -------------------------------------------------------------------------
+### Average BMI classifications
+## from 1-6 respresenting underweight to obese respectively
+## pregnant woman (96) and other (99) were excluded
+
+## Underweight (1): 1%
+nrow(participant_data[participant_data$HWT_DISW_COM == 1,]) /
+  nrow(participant_data[!is.na(participant_data$HWT_DISW_COM) |
+                          participant_data$HWT_DISW_COM < 96,])
+## Normal weight (2) 27%
+nrow(participant_data[participant_data$HWT_DISW_COM == 2,]) /
+  nrow(participant_data[!is.na(participant_data$HWT_DISW_COM)|
+                          participant_data$HWT_DISW_COM < 96,])
+## Overweight (3) 39%
+nrow(participant_data[participant_data$HWT_DISW_COM == 3,]) /
+  nrow(participant_data[!is.na(participant_data$HWT_DISW_COM)|
+                          participant_data$HWT_DISW_COM < 96,])
+## Obese - Class I (4) 22%
+nrow(participant_data[participant_data$HWT_DISW_COM == 4,]) /
+  nrow(participant_data[!is.na(participant_data$HWT_DISW_COM)|
+                          participant_data$HWT_DISW_COM < 96,])
+## Obese - Class II (5) 7% %
+nrow(participant_data[participant_data$HWT_DISW_COM == 5,]) /
+  nrow(participant_data[!is.na(participant_data$HWT_DISW_COM)|
+                          participant_data$HWT_DISW_COM < 96,])
+## Obese - Class III  4%
+nrow(participant_data[participant_data$HWT_DISW_COM == 6,]) /
+  nrow(participant_data[!is.na(participant_data$HWT_DISW_COM)|
+                          participant_data$HWT_DISW_COM < 96,])
+
+
+## ----------------------------------------------------------------------------
+### The smoking status of Participants
+## Daily smokers: 13%
+nrow(participant_data[participant_data$SMK_CURRCG_COM == 1,]) /
+  nrow(participant_data[!is.na(participant_data$SMK_CURRCG_COM),])
+## Occasional Smokers: 3%
+nrow(participant_data[participant_data$SMK_CURRCG_COM == 2,]) /
+  nrow(participant_data[!is.na(participant_data$SMK_CURRCG_COM),])
+##Done Smoke (have not in the past 30 days): 84
+nrow(participant_data[participant_data$SMK_CURRCG_COM == 3,]) /
+  nrow(participant_data[!is.na(participant_data$SMK_CURRCG_COM),])
+
+## ------------------------------------------------------------------------
+# ### Ethnicity
+
+## RATHER THAN DISPLAYING PERCENTAGES, WE WILL PUT HOW MANY INDVIDUALS IDENTIFY
+## WITH THE ETHNIC GROUP. THEN WE GENERALIZE BASED ON GEOGRAPHIC LOCATION
+## BECAUSE WE DO NOT HAVE ENOUGH REPRESENTATION 
+# ## change data to long data to include ethnicity from both sides
+ethn_df <- pivot_longer(participant_data,cols = c("SDC_ETHN_OTSP01_COM","SDC_ETHN_OTSP02_COM"),
+                        names_to="SDC_col",
+                        values_to="ethnicity") # %>%
+
+## Ethnic Origins Related to North America (First nations): 9
+ethn_df[!is.na(ethn_df$ethnicity),] %>%
+  .[.$ethnicity == 21,] %>%
+  nrow()
+## Ethnic Origins Related to Europe: 161
+ethn_df[!is.na(ethn_df$ethnicity),] %>%
+  .[.$ethnicity >= 22 & .$ethnicity <= 44,] %>%
+  nrow()
+## Ethnic Origins Related to South America: 11
+ethn_df[!is.na(ethn_df$ethnicity),] %>%
+  .[.$ethnicity >= 45 & .$ethnicity <= 53,] %>%
+  nrow()
+## Ethnic Origins Related to Africa: 6
+ethn_df[!is.na(ethn_df$ethnicity),] %>%
+  .[.$ethnicity >= 54 & .$ethnicity <= 61,] %>%
+  nrow()
+## Ethnic Origins Related to Asia: 23
+ethn_df[!is.na(ethn_df$ethnicity),] %>%
+  .[.$ethnicity >= 62 & .$ethnicity <= 74,] %>%
+  nrow()
+
+##----------------------------------------------------------------- ## Income 
+
+## 1: less than 20 000
+nrow(participant_data[participant_data$INC_TOT_COM == 1,]) /
+  (1445-78)
+## 2: 20 000 < x > 50 000
+nrow(participant_data[participant_data$INC_TOT_COM == 2,]) /
+  (1445-78)
+## 3: 50 000 < x > 100 000
+nrow(participant_data[participant_data$INC_TOT_COM == 3,]) /
+  (1445-78)
+## 4: 100 000 < x> 150 000
+nrow(participant_data[participant_data$INC_TOT_COM == 4,]) /
+  (1445-78)
+## 5: 150 000 or more
+nrow(participant_data[participant_data$INC_TOT_COM == 5,]) /
+  (1445-78)
+## 7,8,9: missing, refused, don't know
+nrow(participant_data[participant_data$INC_TOT_COM > 5,]) /
+  nrow(participant_data[!is.na(participant_data$INC_TOT_COM),])
+
+## -------------------------------------------------------------------------
+### Pollutant averages
+# pm25_exp_com       6.59 microgram/m^3         sd 3.81
+mean(participant_data$pm25_exp_com[participant_data$pm25_exp_com >= 0],
+     na.rm = TRUE)
+sd(participant_data$pm25_exp_com[participant_data$pm25_exp_com >= 0],
+   na.rm = TRUE)
+
+# no2_exp_com         9.26 ppb                  sd 6.04
+# ppb*46.0055/24.45   17.37 microgram/m^3       sd 11.36
+mean(participant_data$no2_exp_com[participant_data$no2_exp_com >= 0],
+     na.rm = TRUE)
+sd(participant_data$no2_exp_com[participant_data$no2_exp_com >= 0],
+   na.rm = TRUE)
+
+# o3_exp_com        23.89 ppb                   sd 8.98
+# (ppb*48/24.45)    46.90 microgram/m^3         sd 17.63
+mean(participant_data$o3_exp_com[participant_data$o3_exp_com >= 0],
+     na.rm = TRUE)
+sd(participant_data$o3_exp_com[participant_data$o3_exp_com >= 0],
+   na.rm = TRUE)
+
+# so2_exp_com        0.93 ppb                   sd 1.433
+# (ppb*64.066/24.45) 2.43 microgram/m^3         sd 3.73
+mean(participant_data$so2_exp_com[participant_data$so2_exp_com >= 0],
+     na.rm = TRUE)
+sd(participant_data$so2_exp_com[participant_data$so2_exp_com >= 0],
+   na.rm = TRUE)
+
+## Multipollutant exposure
+mean(participant_data$multipollutant_exp[participant_data$multipollutant_exp >= 0],
+     na.rm = TRUE)
+sd(participant_data$multipollutant_exp[participant_data$multipollutant_exp >= 0],
+   na.rm = TRUE)
+
+
+```
+
+
+## Designed functions
+  ### Function for the generalized linear model
+```{r}
+### Total CpGs split into four groups, each glm is performed on each ind. CpG.
+subset_mp_glm <- function(pollutant, range1, range2){
+  registerDoMC(5)
+  check <- data.frame(name = NULL) 
+  write_csv(check,file="test.csv")
+  foreach(i=colnames(epigenetic_table)[range1:range2],
+          .combine=bind_rows) %dopar% {
+            # flush.console()
+            #i <- "cg00000029"
+            check <- bind_rows(check,tibble(name=i))
+            write_csv(check,append=TRUE,file = "test.csv")
+            probe_id <-  i
+            subset_table <- epigenetic_table[,c("V1",..probe_id)]
+            subset_clinical <- clinical_data_mp[clinical_data_mp[[pollutant]] > 0]
+            single_df <- left_join(subset_table,
+                                   subset_clinical,
+                                   by=c("V1"="ADM_EPIGEN2_COM"))
+            colnames(single_df)[2] <- "beta_value"
+            glm_formula <- paste("beta_value ~", pollutant, "+
+                                             SEX_ASK_COM + ED_HSGR_COM +
+                                             AGE_NMBR_COM +
+                                             SDC_ETHN_OTSP01_COM + 
+                                             SDC_ETHN_OTSP02_COM +
+                                             SMK_CURRCG_COM + 
+                                             ALC_FREQ_COM +
+                                             HWT_DISW_COM + 
+                                             INC_TOT_COM")
+            model = try(glm(glm_formula,
+                            data = single_df,
+                            family = "gaussian"))
+            if(class(model)[1]=="try-error"){
+              rr <- NULL
+            }else{
+              rr = data.frame(broom::tidy(model),
+                              probe_id=probe_id) }
+            rr}}
+
+### Uses the combines the subsets into a single file for further analysis
+pollutant_glm <- function(pollutant,s1_name,s2_name,s3_name,s4_name){
+  write.csv(first_subset <- subset_mp_glm(pollutant,2,200000), s1_name)
+  write.csv(second_subset <- subset_mp_glm(pollutant, 200001,400000), s2_name)
+  write.csv(third_subset <- subset_mp_glm(pollutant, 400001,600000), s3_name)
+  write.csv(fourth_subset <- subset_mp_glm(pollutant, 600001, 783137), s4_name)}
+```
+
+  ### Functions for annotated CpGs
+```{r}
+##---------------------------------------------------------------------------
+### Annotate the cpg_data
+anno_data_EPIC <- as.data.frame(getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19))
+
+
+pvalue_and_annotate <- function(df){
+  df <- left_join(df, anno_data_EPIC,
+                  by=c("probe_id" = "Name"))[,c(1:8,24,27,29)]
+  df$chr <- as.integer(sub('...','',df$chr))
+  df$pos <- as.integer(df$pos)
+  df$adj_pvalue <-  p.adjust(df$p.value,method="BH")
+  df}
+```
+
+  ### Find CpGs with a trend towards association (FDR < 0.5)
+```{r}
+##----------------------------------------------------------------------------
+### Keep methylation sites if they pass the listed threshold after correction
+significant_values <- function(df){
+  filter(df, adj_pvalue<0.5)}
+ #test1 <-subset_mp_glm("aqaix12_01", 405601 ,406601)
+```
+
+
+
+## GLM output
+  ### Running glm for all Pollutants
+```{r}
+## 3 Year Ambient Multi-pollutant
+## write the subsets as a csv.
+pollutant_glm("multipollutant_exp","mp3_first_subset.csv","mp3_second_subset.csv",
+              "mp3_third_subset.csv","mp3_fourth_subset.csv")
+
+## ---------------------------------------------------------------------------
+
+## 24h PM2.5 Exposure
+## produce glm of pm25_exp_com
+pollutant_glm("pm25_exp_com","pm25_exp_com_first_subset",
+              "pm25_exp_com_second_subset","pm25_exp_com_third_subset",
+              "pm25_exp_com_fourth_subset")
+
+##----------------------------------------------------------------------------
+## produce glm of no2_exp_com
+pollutant_glm("no2_exp_com","no2_exp_com_first_subset",
+              "no2_exp_com_second_subset","no2_exp_com_third_subset",
+              "no2_exp_com_fourth_subset")
+
+##-----------------------------------------------------------------------------
+
+## produce glm of o3_exp_com
+pollutant_glm("o3_exp_com","o3_com_first_subset",
+              "o3_com_second_subset","o3_com_third_subset",
+              "o3_com_fourth_subset")
+
+## ----------------------------------------------------------------------------
+
+## produce glm of so2_exp_com
+pollutant_glm("so2_exp_com","so2_exp_com_first_subset",
+              "so2_exp_com_second_subset","so2_exp_com_third_subset",
+              "so2_exp_com_fourth_subset")
+
+```
+
+  ### Read  and annotate the glm's CSV output
+    #### Also find significant values
+```{r}
+## Multipollutant
+
+mp_first_subset <- fread("mp3_first_subset.csv")[,-1]
+mp_second_subset <- fread("mp3_second_subset.csv")[,-1]
+mp_third_subset <- fread("mp3_third_subset.csv")[,-1]
+mp_fourth_subset <- fread("mp3_fourth_subset.csv")[,-1]
+
+df_mp <- rbind(mp_first_subset,
+               mp_second_subset,
+               mp_third_subset,
+               mp_fourth_subset) %>%
+  filter(term=="multipollutant_exp")
+df_mp <- pvalue_and_annotate(df_mp)
+df_significant_mp <- significant_values(df_mp)
+
+##-----------------------------------------------------------------------------
+
+## PM2.5
+
+exp_first_subset <- fread("pm25_exp_com_first_subset")[,-1]
+exp_second_subset <- fread("pm25_exp_com_second_subset")[,-1]
+exp_third_subset <- fread("pm25_exp_com_third_subset")[,-1]
+exp_fourth_subset <- fread("pm25_exp_com_fourth_subset")[,-1]
+
+df_exp_bind <- rbind(exp_first_subset,
+                     exp_second_subset,
+                     exp_third_subset,
+                     exp_fourth_subset) %>%
+  filter(term=="pm25_exp_com")
+df_exp <- pvalue_and_annotate(df_exp_bind)
+df_significant_exp <- significant_values(df_exp)
+
+##-----------------------------------------------------------------------------
+
+## NO2
+
+no2_first_subset <- fread("no2_exp_com_first_subset")[,-1]
+no2_second_subset <- fread("no2_exp_com_second_subset")[,-1]
+no2_third_subset <- fread("no2_exp_com_third_subset")[,-1]
+no2_fourth_subset <- fread("no2_exp_com_fourth_subset")[,-1]
+
+df_no2 <- rbind(no2_first_subset,
+                     no2_second_subset,
+                     no2_third_subset,
+                     no2_fourth_subset) %>%
+  filter(term=="no2_exp_com")
+df_no2 <- pvalue_and_annotate(df_no2)
+df_significant_no2 <- significant_values(df_no2)
+
+##-----------------------------------------------------------------------------
+
+## O3
+
+o3_first_subset <- fread("o3_com_first_subset")[,-1]
+o3_second_subset <- fread("o3_com_second_subset")[,-1]
+o3_third_subset <- fread("o3_com_third_subset")[,-1]
+o3_fourth_subset <- fread("o3_com_fourth_subset")[,-1]
+
+df_o3 <- rbind(o3_first_subset,
+                     o3_second_subset,
+                     o3_third_subset,
+                     o3_fourth_subset) %>%
+  filter(term=="o3_exp_com")
+df_o3 <- pvalue_and_annotate(df_o3)
+df_significant_o3 <- significant_values(df_o3)
+
+##-----------------------------------------------------------------------------
+
+## SO2 
+
+so2_first_subset <- fread("so2_exp_com_first_subset")[,-1]
+so2_second_subset <- fread("so2_exp_com_second_subset")[,-1]
+so2_third_subset <- fread("so2_exp_com_third_subset")[,-1]
+so2_fourth_subset <- fread("so2_exp_com_fourth_subset")[,-1]
+
+df_so2 <- rbind(so2_first_subset,
+                     so2_second_subset,
+                     so2_third_subset,
+                     so2_fourth_subset) %>%
+  filter(term=="so2_exp_com")
+df_so2 <- pvalue_and_annotate(df_so2)
+df_significant_so2 <- significant_values(df_so2)
+```
+
+  
+
+## **Aim 1:** Individual CpGs associated with air pollution
+  ### Top CpG sites of GLM output
+```{r}
+## Multi-pollutant
+
+## Top 25 CpGs sites
+mp_top25 <- df_mp[order(df_mp$p.value),]
+mp_top25 <- mp_top25[c(1:25),]
+mp_top25 <- mp_top25[,c("chr", "pos", "probe_id", "Relation_to_Island",
+                        "UCSC_RefGene_Name", "UCSC_RefGene_Group",
+                        "estimate", "std.error", "p.value", "adj_pvalue")]
+
+mp_manhattan_plot <-  manhattan(df_mp, chr="chr",
+                                bp="pos",
+                                snp="probe_id",
+                                p="p.value",
+                                highlight = mp_top25$probe_id,
+                                annotatePval = 0.05)
+
+write_csv(mp_top25, "mp3_top25.csv")
+
+
+##-----------------------------------------------------------------------------
+
+## PM2.5
+
+## Obtain top 25 CpG sites
+exp_top25 <- df_exp[order(df_exp$p.value),]
+exp_top25 <- exp_top25[c(1:25),]
+exp_top25 <- exp_top25[,c("chr", "pos", "probe_id", "Relation_to_Island",
+                        "UCSC_RefGene_Name", "UCSC_RefGene_Group",
+                        "estimate", "std.error", "p.value", "adj_pvalue")]
+
+mp_manhattan_plot <-  manhattan(df_exp, chr="chr",
+                                bp="pos",
+                                snp="probe_id",
+                                p="p.value",
+                                highlight = exp_top25$probe_id,
+                                annotatePval = 0.05)
+
+##-----------------------------------------------------------------------------
+
+## NO2
+
+## Obtain top 25 CpG sites most likely associated to NO2
+no2_top25 <- df_no2[order(df_no2$p.value),]
+no2_top25 <- no2_top25[c(1:25),]
+no2_top25 <- no2_top25[,c("chr", "pos", "probe_id", "Relation_to_Island",
+                        "UCSC_RefGene_Name", "UCSC_RefGene_Group",
+                        "estimate", "std.error", "p.value", "adj_pvalue")]
+
+
+##-----------------------------------------------------------------------------
+
+## O3 
+
+## Obtain top 25 CpG sites most likely associated to O3
+o3_top25 <- df_o3[order(df_o3$p.value),]
+o3_top25 <- o3_top25[c(1:25),]
+o3_top25 <- o3_top25[,c("chr", "pos", "probe_id", "Relation_to_Island",
+                        "UCSC_RefGene_Name", "UCSC_RefGene_Group",
+                        "estimate", "std.error", "p.value", "adj_pvalue")]
+
+
+## ----------------------------------------------------------------------------
+
+## SO2
+
+## Obtain top 25 CpG sites most likely associated to SO2
+so2_top25 <- df_so2[order(df_so2$p.value),]
+so2_top25 <- so2_top25[c(1:25),]
+so2_top25 <- so2_top25[,c("chr", "pos", "probe_id", "Relation_to_Island",
+                        "UCSC_RefGene_Name", "UCSC_RefGene_Group",
+                        "estimate", "std.error", "p.value", "adj_pvalue")]
+
+```
+  ### Manhattan Plots
+```{r}
+## Multi-pollutant
+
+## Manhattan plot of the association between Multi-pollutant exposure
+## and methylation
+
+don_mp <- df_mp[-log10(df_mp$p.value) > 1,] %>%
+  group_by(chr) %>%
+  summarise(chr_len=max(pos)) %>%
+  mutate(tot=cumsum(as.numeric(chr_len))-as.numeric(chr_len)) %>%
+  dplyr::select(-chr_len) %>%
+  left_join(df_mp[-log10(df_mp$p.value) > 1,], ., by=c("chr"="chr")) %>%
+  arrange(chr,pos) %>%
+  mutate(poscum=(pos+tot))
+
+axisdf = don_mp %>%
+  group_by(chr) %>%
+  summarize(center=(max(poscum)+ min(poscum))/2)
+
+mp_manplot <- ggplot(don_mp, aes(x=poscum, y=-log10(p.value))) +
+  
+  ## Show all points palette: fishualize::Mycteroperca_bonaci
+  geom_point( aes(color=as.factor(chr)), alpha=0.8, size=1.3) +
+  scale_color_manual(values = rep(c("darkgray", "black"), 22 )) +
+  
+  ## Title and axis:
+  ggtitle("3 Year Ambient Multi-pollutant Exposure") +
+  xlab("Chromosome") +
+  ylab("-log10(observed p-value)") +
+  
+  
+  ## custom X axis:
+  scale_x_continuous( label = axisdf$chr, breaks= axisdf$center ) +
+  scale_y_continuous(expand = c(0, 0) ) +     # remove space between plot area and x axis
+  
+  ## highlight points that pass the threshold, colour based on methylated effect
+  ## blue for hypermethylated, red for hypomethylated
+  geom_point(data=subset(don_mp, adj_pvalue <= 0.5 & estimate < 0),
+             colour="red",
+             size = 2.1) +
+  geom_point(data=subset(don_mp, adj_pvalue <= 0.5 & estimate > 0),
+             colour="blue",
+             size = 2.1) +
+  
+  ## label the points that pass the threshold value
+  geom_label_repel(data=subset(don_mp, adj_pvalue <= 0.5),
+                   aes(label=probe_id), size=2.8) +
+  
+  coord_cartesian(ylim = c(0,7)) +
+  # Custom the theme:
+  theme_bw() +
+  theme(
+    legend.position="none",
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  )
+
+# write.csv(don_mp, file = "don_mp.csv")
+
+##-----------------------------------------------------------------------------
+
+## PM2.5
+
+## A more Customizable Manhattan plot
+don_exp <- df_exp[-log10(df_exp$p.value) > 1,] %>%
+  group_by(chr) %>%
+  summarise(chr_len=max(pos)) %>%
+  mutate(tot=cumsum(as.numeric(chr_len))-as.numeric(chr_len)) %>%
+  dplyr::select(-chr_len) %>%
+  left_join(df_exp[-log10(df_exp$p.value) > 1,], ., by=c("chr"="chr")) %>%
+  arrange(chr,pos) %>%
+  mutate(poscum=(pos+tot))
+
+axisdf = don_exp %>%
+  group_by(chr) %>%
+  summarize(center=(max(poscum)+ min(poscum))/2)
+
+exp_manplot <- ggplot(don_exp, aes(x=poscum, y=-log10(p.value))) +
+  
+  # Show all points palette: fishualize::Mycteroperca_bonaci
+  geom_point(data = subset(don_exp, adj_pvalue > 0.5),
+             aes(color=as.factor(chr)), alpha=0.8, size=1.3) +
+  scale_color_manual(values = rep(c("darkgray", "black"), 22 ),
+                     guide = "none") +
+  
+  #Title and axis: main=expression("PM"[2.5]*" Exposure"))
+  ggtitle(expression("Association to 24 h PM"[2.5]*" Exposure")) +
+  xlab("Chromosome") +
+  ylab("-log10(observed p-value)") +
+  
+  
+  # custom X axis:
+  scale_x_continuous( label = axisdf$chr, breaks= axisdf$center ) +
+  scale_y_continuous(expand = c(0, 0) ) +  
+  # remove space between plot area and x axis
+  
+  # highlight points that pass the threshold, colour based on methylated effect
+  # blue for hypermethylated, red for hypomethylated
+  #geom_point(data=subset(don_exp, adj_pvalue <= 0.5 & estimate < 0),
+  #           aes(color = "Decrease"), size = 1.5) +
+  #geom_point(data=subset(don_exp, adj_pvalue <= 0.5 & estimate > 0),
+  #           aes(color = "Increase"), size = 1.5) +
+  geom_point(data=subset(don_exp, adj_pvalue <= 0.5 & estimate < 0),
+             colour="red",
+             size = 2.1) +
+  geom_point(data=subset(don_exp, adj_pvalue <= 0.5 & estimate > 0),
+             colour="blue",
+             size = 2.1) +
+  # scale_color_manual(
+  # values = c("Increase" = "blue",
+  #            "Decrease" = "red"),
+  # name = "",
+  # labels = c("Increased Methylation", "Decreased Methylation")) + 
+  #label the points that pass the threshold value
+  geom_label_repel(data=don_exp[order(don_exp$adj_pvalue),][c(1:10)],
+                   aes(label=probe_id),
+                   min.segment.length = unit(0, 'lines'),
+                   size=2.8) +
+  
+  coord_cartesian(ylim = c(0,7)) +
+  # Custom the theme:
+  theme_bw() +
+  theme(
+    legend.position= c(0.9, 1.08),
+    legend.justification = c(1,1),
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  )
+
+#guides(color = guide_legend(override.aes = list(size = 3)))
+
+# write.csv(don_exp, file = "don_exp.csv")
+
+##----------------------------------------------------------------------------
+
+## NO2
+
+## A more Customizable Manhattan plot
+don_no2 <- df_no2[-log10(df_no2$p.value) > 1,] %>%
+  group_by(chr) %>%
+  summarise(chr_len=max(pos)) %>%
+  mutate(tot=cumsum(as.numeric(chr_len))-as.numeric(chr_len)) %>%
+  dplyr::select(-chr_len) %>%
+  left_join(df_no2[-log10(df_no2$p.value) > 1,], ., by=c("chr"="chr")) %>%
+  arrange(chr,pos) %>%
+  mutate(poscum=(pos+tot))
+
+axisdf = don_no2 %>%
+  group_by(chr) %>%
+  summarize(center=(max(poscum)+ min(poscum))/2)
+
+no2_manplot <- ggplot(don_no2, aes(x=poscum, y=-log10(p.value))) +
+  
+  # Show all points palette: fishualize::Mycteroperca_bonaci
+  geom_point( aes(color=as.factor(chr)), alpha=0.8, size=1.3) +
+  scale_color_manual(values = rep(c("darkgray", "black"), 22 )) +
+  
+  #  geom_hline(yintercept=-log10(1.276817e-06), linetype="dashed", color = "red") +
+  
+  #Title and axis:
+  ggtitle(expression("24 h NO"[2]*"")) +
+  xlab("Chromosome") +
+  ylab("-log10(observed p-value)") +
+  
+  
+  # custom X axis:
+  scale_x_continuous( label = axisdf$chr, breaks= axisdf$center ) +
+  scale_y_continuous(expand = c(0, 0) ) +     # remove space between plot area and x axis
+  
+  # highlight points that pass the threshold, colour based on methylated effect
+  # blue for hypermethylated, red for hypomethylated
+  geom_point(data=subset(don_no2, adj_pvalue <= 0.5 & estimate < 0),
+             colour="red",
+             size = 2.1) +
+  geom_point(data=subset(don_no2, adj_pvalue <= 0.5 & estimate > 0),
+             colour="blue",
+             size = 2.1) +
+  
+  #label the points that pass the threshold value
+  geom_label_repel(data=don_no2[order(don_no2$adj_pvalue),][c(1:10)],
+                   aes(label=probe_id),
+                   min.segment.length = unit(0, 'lines'),
+                   size=2.8) +
+
+coord_cartesian(ylim = c(0,7)) +
+  # Custom the theme:
+  theme_bw() +
+  theme(
+    legend.position="none",
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  )
+
+# write.csv(don_no2, file = "don_no2.csv")
+    
+##----------------------------------------------------------------------------
+    
+## O3
+    
+## A more Customizable Manhattan plot
+don_o3 <- df_o3[-log10(df_o3$p.value) > 1,] %>%
+  group_by(chr) %>%
+  summarise(chr_len=max(pos)) %>%
+  mutate(tot=cumsum(as.numeric(chr_len))-as.numeric(chr_len)) %>%
+  dplyr::select(-chr_len) %>%
+  left_join(df_o3[-log10(df_o3$p.value) > 1,], ., by=c("chr"="chr")) %>%
+  arrange(chr,pos) %>%
+  mutate(poscum=(pos+tot))
+
+axisdf = don_o3 %>%
+  group_by(chr) %>%
+  summarize(center=(max(poscum)+ min(poscum))/2)
+
+o3_manplot <- ggplot(don_o3, aes(x=poscum, y=-log10(p.value))) +
+  
+  # Show all points palette: fishualize::Mycteroperca_bonaci
+  geom_point( aes(color=as.factor(chr)), alpha=0.8, size=1.3) +
+  scale_color_manual(values = rep(c("darkgray", "black"), 22 )) +
+  
+  #Title and axis:
+  ggtitle(expression("24 h O"[3]*"")) +
+  xlab("Chromosome") +
+  ylab("-log10(observed p-value)") +
+  
+  
+  # custom X axis:
+  scale_x_continuous( label = axisdf$chr, breaks= axisdf$center ) +
+  scale_y_continuous(expand = c(0, 0) ) +     # remove space between plot area and x axis
+  
+  # highlight points that pass the threshold, colour based on methylated effect
+  # blue for hypermethylated, red for hypomethylated
+  geom_point(data=subset(don_o3, adj_pvalue <= 0.5 & estimate < 0),
+             colour="red",
+             size = 2.1) +
+  geom_point(data=subset(don_o3, adj_pvalue <= 0.5 & estimate > 0),
+             colour="blue",
+             size = 2.1) +
+  
+  #label the points that pass the threshold value
+  geom_label_repel(data=subset(don_o3, adj_pvalue <= 0.5),
+                   aes(label=probe_id), size=2.8) +
+  
+  
+  coord_cartesian(ylim = c(0,7)) +
+  # Custom the theme:
+  theme_bw() +
+  theme(
+    legend.position="none",
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank()
+  )
+
+# write.csv(don_o3, file = "don_o3.csv")
+## ----------------------------------------------------------------------------
+
+## SO2
+
+## A more Customizable Manhattan plot
+don_so2 <- df_so2[-log10(df_so2$p.value) > 1,] %>%
+  group_by(chr) %>%
+  summarise(chr_len=max(pos)) %>%
+  mutate(tot=cumsum(as.numeric(chr_len))-as.numeric(chr_len)) %>%
+  dplyr::select(-chr_len) %>%
+  left_join(df_so2[-log10(df_so2$p.value) > 1,], ., by=c("chr"="chr")) %>%
+  arrange(chr,pos) %>%
+  mutate(poscum=(pos+tot))
+
+axisdf = don_so2 %>%
+  group_by(chr) %>%
+  summarize(center=(max(poscum)+ min(poscum))/2)
+
+so2_manplot <- ggplot(don_so2, aes(x=poscum, y=-log10(p.value))) +
+
+    # Show all points palette: fishualize::Mycteroperca_bonaci
+    geom_point( aes(color=as.factor(chr)), alpha=0.8, size=1.3) +
+    scale_color_manual(values = rep(c("darkgray", "black"), 22 )) +
+  
+    #Title and axis:
+    ggtitle(expression("24 h SO"[2]*"")) +
+    xlab("Chromosome") +
+    ylab("-log10(observed p-value)") +
+    
+
+    # custom X axis:
+    scale_x_continuous( label = axisdf$chr, breaks= axisdf$center ) +
+    scale_y_continuous(expand = c(0, 0) ) +     # remove space between plot area and x axis
+  
+    # highlight points that pass the threshold, colour based on methylated effect
+    # blue for hypermethylated, red for hypomethylated
+    geom_point(data=subset(don_so2, adj_pvalue <= 0.5 & estimate < 0),
+               colour="red",
+               size = 2.1) +
+    geom_point(data=subset(don_so2, adj_pvalue <= 0.5 & estimate > 0),
+               colour="blue",
+               size = 2.1) +
+    
+    #label the points that pass the threshold value
+    geom_label_repel(data=subset(don_so2, adj_pvalue <= 0.5),
+                    aes(label=probe_id), size=2.8) +
+  
+    coord_cartesian(ylim = c(0,7)) +
+    # Custom the theme:
+    theme_bw() +
+    theme(
+      legend.position="none",
+      panel.border = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank()
+    )
+
+## write.csv(don_so2, file = "don_so2.csv")
+```
+
+
+## **Aim 2:** Genomic Regions associated air pollution
+  ### CGI-related regions - forest plot
+```{r}
+## Multi-pollutant
+
+## Multipollutant Methylation Patterns
+## https://stackoverflow.com/questions/38062650/forest-plot-for-a-beginner-simple-example-using-ggplot2-edited
+allprobes_ttest <- t.test(df_mp$estimate, mu = 0)
+allprobes_mean <- mean(df_mp$estimate)
+allprobes_lower <- allprobes_ttest$conf.int[1]
+allprobes_upper <- allprobes_ttest$conf.int[2]
+
+opensea_df <- df_mp[df_mp$Relation_to_Island == "OpenSea",]
+opensea_ttest <- t.test(opensea_df$estimate, mu = 0)
+opensea_mean <- mean(opensea_df$estimate)
+opensea_lower <- opensea_ttest$conf.int[1]
+opensea_upper <- opensea_ttest$conf.int[2]
+
+island_df <- df_mp[df_mp$Relation_to_Island == "Island",]
+island_ttest <- t.test(island_df$estimate, mu = 0)
+island_mean <- mean(island_df$estimate)
+island_lower <- island_ttest$conf.int[1]
+island_upper <- island_ttest$conf.int[2]
+
+shore_df <- df_mp[df_mp$Relation_to_Island == "N_Shore" |
+                  df_mp$Relation_to_Island == "S_Shore" ,]
+shore_ttest <- t.test(shore_df$estimate, mu = 0)
+shore_mean <- mean(shore_df$estimate)
+shore_lower <- shore_ttest$conf.int[1]
+shore_upper <- shore_ttest$conf.int[2]
+
+shelf_df <- df_mp[df_mp$Relation_to_Island == "N_Shelf" |
+                  df_mp$Relation_to_Island == "S_Shelf" ,]
+shelf_ttest <- t.test(shelf_df$estimate, mu = 0)
+shelf_mean <- mean(shelf_df$estimate)
+shelf_lower <- shelf_ttest$conf.int[1]
+shelf_upper <- shelf_ttest$conf.int[2]
+
+
+
+df_relation <- data.frame(label = c("All probes","Open Sea", "Island",
+                                    "Shore","Shelf"),
+                          mean = c(allprobes_mean,opensea_mean,island_mean,
+                                   shore_mean,shelf_mean),
+                          lower = c(allprobes_lower,opensea_lower,island_lower,
+                                    shore_lower,shelf_lower),
+                          upper = c(allprobes_upper,opensea_upper,island_upper,
+                                    shore_upper,shelf_upper),
+                          pollutatn = "Multi-pollutant")
+## reverses the factor level ordering for labels
+df_relation$label <- factor(df_relation$label,
+                            levels=rev(df_relation$label))
+forest_plot_mp <- ggplot(data=df_relation, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle("3 Year Ambient Multi-pollutant Exposure") +
+  ylab(expression(paste(Delta, beta, " per indicator unit"))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-0.00015,0.00015)) +
+  theme(legend.position = "none")
+
+## ----------------------------------------------------------------------------
+
+## PM2.5
+
+## 24h PM2.5 Exposure Methylation Patterns
+## https://stackoverflow.com/questions/38062650/forest-plot-for-a-beginner-simple-example-using-ggplot2-edited
+
+
+## 24h PM2.5 exposure Methylation Patterns
+allprobes_ttest_exp <- t.test(df_exp$estimate, mu = 0)
+allprobes_mean_exp <- mean(df_exp$estimate)
+allprobes_lower_exp <- allprobes_ttest_exp$conf.int[1]
+allprobes_upper_exp <- allprobes_ttest_exp$conf.int[2]
+
+opensea_df_exp <- df_exp[df_exp$Relation_to_Island == "OpenSea",]
+opensea_ttest_exp <- t.test(opensea_df_exp$estimate, mu = 0)
+opensea_mean_exp <- mean(opensea_df_exp$estimate)
+opensea_lower_exp <- opensea_ttest_exp$conf.int[1]
+opensea_upper_exp <- opensea_ttest_exp$conf.int[2]
+
+island_df_exp <- df_exp[df_exp$Relation_to_Island == "Island",]
+island_ttest_exp <- t.test(island_df_exp$estimate, mu = 0)
+island_mean_exp <- mean(island_df_exp$estimate)
+island_lower_exp <- island_ttest_exp$conf.int[1]
+island_upper_exp <- island_ttest_exp$conf.int[2]
+
+shore_df_exp <- df_exp[df_exp$Relation_to_Island == "N_Shore" |
+                  df_exp$Relation_to_Island == "S_Shore" ,]
+shore_ttest_exp <- t.test(shore_df_exp$estimate, mu = 0)
+shore_mean_exp <- mean(shore_df_exp$estimate)
+shore_lower_exp <- shore_ttest_exp$conf.int[1]
+shore_upper_exp <- shore_ttest_exp$conf.int[2]
+
+shelf_df_exp <- df_exp[df_exp$Relation_to_Island == "N_Shelf" |
+                  df_exp$Relation_to_Island == "S_Shelf" ,]
+shelf_ttest_exp <- t.test(shelf_df_exp$estimate, mu = 0)
+shelf_mean_exp <- mean(shelf_df_exp$estimate)
+shelf_lower_exp <- shelf_ttest_exp$conf.int[1]
+shelf_upper_exp <- shelf_ttest_exp$conf.int[2]
+
+
+
+df_relation_exp <- data.frame(label = c("All probes","Open Sea", "Island",
+                                    "Shore","Shelf"),
+                          mean = c(allprobes_mean_exp,opensea_mean_exp,
+                                   island_mean_exp,shore_mean_exp,
+                                   shelf_mean_exp),
+                          lower = c(allprobes_lower_exp,opensea_lower_exp,
+                                    island_lower_exp,shore_lower_exp,
+                                    shelf_lower_exp),
+                          upper = c(allprobes_upper_exp,opensea_upper_exp,
+                                    island_upper_exp,shore_upper_exp,
+                                    shelf_upper_exp),
+                          pollutant = "PM[2.5]")
+## reverses the factor level ordering for labels
+df_relation_exp$label <- factor(df_relation_exp$label,
+                            levels = rev(df_relation_exp$label))
+forest_plot_exp <- ggplot(data = df_relation_exp, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color = as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h PM"[2.5]*" Exposure")) +
+  ylab(expression(paste(Delta,beta, " per ", mu, "g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-2e-7,2e-7))+
+  theme(legend.position = "none")
+
+
+##----------------------------------------------------------------------------
+
+## NO2
+
+## 24 hour no2 Expsore Pathway Ananlysis
+## Multipollutant Methylation Patterns
+## https://stackoverflow.com/questions/38062650/forest-plot-for-a-beginner-simple-example-using-ggplot2-edited
+mutate(df_no2,
+       estimate = estimate/46.0055*24.45,
+       std.error = std.error/46.0055*24.45)
+
+allprobes_ttest <- t.test(df_no2$estimate, mu = 0)
+allprobes_mean <- mean(df_no2$estimate)
+allprobes_lower <- allprobes_ttest$conf.int[1]
+allprobes_upper <- allprobes_ttest$conf.int[2]
+
+opensea_df <- df_no2[df_no2$Relation_to_Island == "OpenSea",]
+opensea_ttest <- t.test(opensea_df$estimate, mu = 0)
+opensea_mean <- mean(opensea_df$estimate)
+opensea_lower <- opensea_ttest$conf.int[1]
+opensea_upper <- opensea_ttest$conf.int[2]
+
+island_df <- df_no2[df_no2$Relation_to_Island == "Island",]
+island_ttest <- t.test(island_df$estimate, mu = 0)
+island_mean <- mean(island_df$estimate)
+island_lower <- island_ttest$conf.int[1]
+island_upper <- island_ttest$conf.int[2]
+
+shore_df <- df_no2[df_no2$Relation_to_Island == "N_Shore" |
+                  df_no2$Relation_to_Island == "S_Shore" ,]
+shore_ttest <- t.test(shore_df$estimate, mu = 0)
+shore_mean <- mean(shore_df$estimate)
+shore_lower <- shore_ttest$conf.int[1]
+shore_upper <- shore_ttest$conf.int[2]
+
+shelf_df <- df_no2[df_no2$Relation_to_Island == "N_Shelf" |
+                  df_no2$Relation_to_Island == "S_Shelf" ,]
+shelf_ttest <- t.test(shelf_df$estimate, mu = 0)
+shelf_mean <- mean(shelf_df$estimate)
+shelf_lower <- shelf_ttest$conf.int[1]
+shelf_upper <- shelf_ttest$conf.int[2]
+
+
+
+df_relation_no2 <- data.frame(label = c("All probes","Open Sea", "Island",
+                                    "Shore","Shelf"),
+                          mean = c(allprobes_mean,opensea_mean,island_mean,
+                                   shore_mean,shelf_mean),
+                          lower = c(allprobes_lower,opensea_lower,island_lower,
+                                    shore_lower,shelf_lower),
+                          upper = c(allprobes_upper,opensea_upper,island_upper,
+                                    shore_upper,shelf_upper),
+                          pollutant = "NO[2]")
+## reverses the factor level ordering for labels
+df_relation_no2$label <- factor(df_relation_no2$label,
+                            levels=rev(df_relation_no2$label))
+forest_plot_no2 <- ggplot(data=df_relation_no2, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color = as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h NO"[2]*" Exposure")) +
+  ylab(expression(paste(Delta,beta, " per ", mu, "g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-4.0e-5,4.0e-5)) +
+  theme(legend.position = "none")
+
+## ----------------------------------------------------------------------------
+
+## O3 
+
+## 24 hour O3 Expsore Pathway Ananlysis
+## Multipollutant Methylation Patterns
+## https://stackoverflow.com/questions/38062650/forest-plot-for-a-beginner-simple-example-using-ggplot2-edited
+mutate(df_o3,
+       estimate = estimate/48*24.45,
+       std.error = std.error/48*24.45)
+
+allprobes_ttest <- t.test(df_o3$estimate, mu = 0)
+allprobes_mean <- mean(df_o3$estimate)
+allprobes_lower <- allprobes_ttest$conf.int[1]
+allprobes_upper <- allprobes_ttest$conf.int[2]
+
+opensea_df <- df_o3[df_o3$Relation_to_Island == "OpenSea",]
+opensea_ttest <- t.test(opensea_df$estimate, mu = 0)
+opensea_mean <- mean(opensea_df$estimate)
+opensea_lower <- opensea_ttest$conf.int[1]
+opensea_upper <- opensea_ttest$conf.int[2]
+
+island_df <- df_o3[df_o3$Relation_to_Island == "Island",]
+island_ttest <- t.test(island_df$estimate, mu = 0)
+island_mean <- mean(island_df$estimate)
+island_lower <- island_ttest$conf.int[1]
+island_upper <- island_ttest$conf.int[2]
+
+shore_df <- df_o3[df_o3$Relation_to_Island == "N_Shore" |
+                  df_o3$Relation_to_Island == "S_Shore" ,]
+shore_ttest <- t.test(shore_df$estimate, mu = 0)
+shore_mean <- mean(shore_df$estimate)
+shore_lower <- shore_ttest$conf.int[1]
+shore_upper <- shore_ttest$conf.int[2]
+
+shelf_df <- df_o3[df_o3$Relation_to_Island == "N_Shelf" |
+                  df_o3$Relation_to_Island == "S_Shelf" ,]
+shelf_ttest <- t.test(shelf_df$estimate, mu = 0)
+shelf_mean <- mean(shelf_df$estimate)
+shelf_lower <- shelf_ttest$conf.int[1]
+shelf_upper <- shelf_ttest$conf.int[2]
+
+
+
+df_relation_o3 <- data.frame(label = c("All probes","Open Sea", "Island",
+                                    "Shore","Shelf"),
+                          mean = c(allprobes_mean,opensea_mean,island_mean,
+                                   shore_mean,shelf_mean),
+                          lower = c(allprobes_lower,opensea_lower,island_lower,
+                                    shore_lower,shelf_lower),
+                          upper = c(allprobes_upper,opensea_upper,island_upper,
+                                    shore_upper,shelf_upper),
+                          pollutant = "O[3]")
+## reverses the factor level ordering for labels
+df_relation_o3$label <- factor(df_relation_o3$label,
+                            levels=rev(df_relation_o3$label))
+forest_plot_o3 <- ggplot(data=df_relation_o3, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color = as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h O"[3]*" Exposure")) +
+  ylab(expression(paste(Delta,beta, " per ", mu, "g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-7.5e-5,7.5e-5)) +
+  theme(legend.position = "none")
+
+##-----------------------------------------------------------------------------
+
+## SO2
+
+## 24 hour SO2 Expsore Pathway Ananlysis
+## Multipollutant Methylation Patterns
+## https://stackoverflow.com/questions/38062650/forest-plot-for-a-beginner-simple-example-using-ggplot2-edited
+
+## We need to change estimate and statistics of SO2 from ppm to ug/m^3
+mutate(df_so2,
+       estimate = estimate/64.066*24.45,
+       std.error = std.error/64.066*24.45)
+
+allprobes_ttest <- t.test(df_so2$estimate, mu = 0)
+allprobes_mean <- mean(df_so2$estimate)
+allprobes_lower <- allprobes_ttest$conf.int[1]
+allprobes_upper <- allprobes_ttest$conf.int[2]
+
+opensea_df <- df_so2[df_so2$Relation_to_Island == "OpenSea",]
+opensea_ttest <- t.test(opensea_df$estimate, mu = 0)
+opensea_mean <- mean(opensea_df$estimate)
+opensea_lower <- opensea_ttest$conf.int[1]
+opensea_upper <- opensea_ttest$conf.int[2]
+
+island_df <- df_so2[df_so2$Relation_to_Island == "Island",]
+island_ttest <- t.test(island_df$estimate, mu = 0)
+island_mean <- mean(island_df$estimate)
+island_lower <- island_ttest$conf.int[1]
+island_upper <- island_ttest$conf.int[2]
+
+shore_df <- df_so2[df_so2$Relation_to_Island == "N_Shore" |
+                  df_so2$Relation_to_Island == "S_Shore" ,]
+shore_ttest <- t.test(shore_df$estimate, mu = 0)
+shore_mean <- mean(shore_df$estimate)
+shore_lower <- shore_ttest$conf.int[1]
+shore_upper <- shore_ttest$conf.int[2]
+
+shelf_df <- df_so2[df_so2$Relation_to_Island == "N_Shelf" |
+                  df_so2$Relation_to_Island == "S_Shelf" ,]
+shelf_ttest <- t.test(shelf_df$estimate, mu = 0)
+shelf_mean <- mean(shelf_df$estimate)
+shelf_lower <- shelf_ttest$conf.int[1]
+shelf_upper <- shelf_ttest$conf.int[2]
+
+
+
+df_relation_so2 <- data.frame(label = c("All probes","Open Sea", "Island",
+                                    "Shore","Shelf"),
+                          mean = c(allprobes_mean,opensea_mean,island_mean,
+                                   shore_mean,shelf_mean),
+                          lower = c(allprobes_lower,opensea_lower,island_lower,
+                                    shore_lower,shelf_lower),
+                          upper = c(allprobes_upper,opensea_upper,island_upper,
+                                    shore_upper,shelf_upper),
+                          pollutant = "SO[2]")
+## reverses the factor level ordering for labels
+df_relation_so2$label <- factor(df_relation_so2$label,
+                            levels=rev(df_relation_so2$label))
+forest_plot_so2 <- ggplot(data=df_relation_so2, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color = as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h SO"[2]*" Exposure")) +
+  ylab(expression(paste(Delta,beta, " per ", mu, "g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-0.015,0.015)) +
+  theme(legend.position = "none")
+
+```
+  ### Gene structure related regions - forest plot
+```{r}
+## Multi-pollutant
+
+## Multipollutant Methylation Patterns
+## https://stackoverflow.com/questions/38062650/forest-plot-for-a-beginner-simple-example-using-ggplot2-edited
+
+## The genomic regions we are observing here are TSS1500,Body, 3'UTR, 5'UTR,
+## TSS200, 
+TSS200_df <- df_mp[grepl("TSS200",df_mp$UCSC_RefGene_Group),]
+TSS200_ttest <- t.test(TSS200_df$estimate, mu = 0)
+TSS200_mean <- mean(TSS200_df$estimate)
+TSS200_lower <- TSS200_ttest$conf.int[1]
+TSS200_upper <- TSS200_ttest$conf.int[2]
+
+TSS1500_df <- df_mp[grepl("TSS1500",df_mp$UCSC_RefGene_Group),]
+TSS1500_ttest <- t.test(TSS1500_df$estimate, mu = 0)
+TSS1500_mean <- mean(TSS1500_df$estimate)
+TSS1500_lower <- TSS1500_ttest$conf.int[1]
+TSS1500_upper <- TSS1500_ttest$conf.int[2]
+
+exon1_df <- df_mp[grepl("1stExon",df_mp$UCSC_RefGene_Group),]
+exon1_ttest <- t.test(exon1_df$estimate, mu = 0)
+exon1_mean <- mean(exon1_df$estimate)
+exon1_lower <- exon1_ttest$conf.int[1]
+exon1_upper <- exon1_ttest$conf.int[2]
+
+body_df <- df_mp[grepl("Body",df_mp$UCSC_RefGene_Group),]
+body_ttest <- t.test(body_df$estimate, mu = 0)
+body_mean <- mean(body_df$estimate)
+body_lower <- body_ttest$conf.int[1]
+body_upper <- body_ttest$conf.int[2]
+
+UTR3_df <- df_mp[grepl("3'UTR",df_mp$UCSC_RefGene_Group),]
+UTR3_ttest <- t.test(UTR3_df$estimate, mu = 0)
+UTR3_mean <- mean(UTR3_df$estimate)
+UTR3_lower <- UTR3_ttest$conf.int[1]
+UTR3_upper <- UTR3_ttest$conf.int[2]
+
+UTR5_df <- df_mp[grepl("5'UTR",df_mp$UCSC_RefGene_Group),]
+UTR5_ttest <- t.test(UTR5_df$estimate, mu = 0)
+UTR5_mean <- mean(UTR5_df$estimate)
+UTR5_lower <- UTR5_ttest$conf.int[1]
+UTR5_upper <- UTR5_ttest$conf.int[2]
+
+
+
+df__region_relation_mp <- data.frame(label = c("TSS200","TSS1500","Body", "1stExon",
+                                    "3'UTR","5'UTR"),
+                          mean = c(TSS200_mean,TSS1500_mean,body_mean,
+                                   exon1_mean,UTR3_mean,UTR5_mean),
+                          lower = c(TSS200_lower,TSS1500_lower,body_lower,
+                                    exon1_lower,UTR3_lower,UTR5_lower),
+                          upper = c(TSS200_upper,TSS1500_upper,body_upper,
+                                    exon1_upper,UTR3_upper,UTR5_upper),
+                          pollutant = "Multi-pollutant")
+## reverses the factor level ordering for labels
+df__region_relation_mp$label <- factor(df__region_relation_mp$label,
+                            levels=rev(df__region_relation_mp$label))
+forest_plot_genes_mp <- ggplot(data=df__region_relation_mp, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red",
+                                    "orange"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle("3 Year Ambient Multi-pollutant Exposure") +
+  ylab(expression(paste(Delta,beta, " per indicator unit"))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-0.00016,0.00016)) +
+  theme(legend.position = "none")
+
+## --------------------------------------------------------------------------
+
+  ## PM2.5 24 h exposure
+## The genomic regions we are observing here are TSS1500,Body, 3'UTR, 5'UTR,
+## TSS200, 
+TSS200_df <- df_exp[grepl("TSS200",df_exp$UCSC_RefGene_Group),]
+TSS200_ttest <- t.test(TSS200_df$estimate, mu = 0)
+TSS200_mean <- mean(TSS200_df$estimate)
+TSS200_lower <- TSS200_ttest$conf.int[1]
+TSS200_upper <- TSS200_ttest$conf.int[2]
+
+TSS1500_df <- df_exp[grepl("TSS1500",df_exp$UCSC_RefGene_Group),]
+TSS1500_ttest <- t.test(TSS1500_df$estimate, mu = 0)
+TSS1500_mean <- mean(TSS1500_df$estimate)
+TSS1500_lower <- TSS1500_ttest$conf.int[1]
+TSS1500_upper <- TSS1500_ttest$conf.int[2]
+
+exon1_df <- df_exp[grepl("1stExon",df_exp$UCSC_RefGene_Group),]
+exon1_ttest <- t.test(exon1_df$estimate, mu = 0)
+exon1_mean <- mean(exon1_df$estimate)
+exon1_lower <- exon1_ttest$conf.int[1]
+exon1_upper <- exon1_ttest$conf.int[2]
+
+body_df <- df_exp[grepl("Body",df_exp$UCSC_RefGene_Group),]
+body_ttest <- t.test(body_df$estimate, mu = 0)
+body_mean <- mean(body_df$estimate)
+body_lower <- body_ttest$conf.int[1]
+body_upper <- body_ttest$conf.int[2]
+
+UTR3_df <- df_exp[grepl("3'UTR",df_exp$UCSC_RefGene_Group),]
+UTR3_ttest <- t.test(UTR3_df$estimate, mu = 0)
+UTR3_mean <- mean(UTR3_df$estimate)
+UTR3_lower <- UTR3_ttest$conf.int[1]
+UTR3_upper <- UTR3_ttest$conf.int[2]
+
+UTR5_df <- df_exp[grepl("5'UTR",df_exp$UCSC_RefGene_Group),]
+UTR5_ttest <- t.test(UTR5_df$estimate, mu = 0)
+UTR5_mean <- mean(UTR5_df$estimate)
+UTR5_lower <- UTR5_ttest$conf.int[1]
+UTR5_upper <- UTR5_ttest$conf.int[2]
+
+
+
+df_region_relation_exp <- data.frame(label = c("TSS200","TSS1500","Body", "1stExon",
+                                    "3'UTR","5'UTR"),
+                          mean = c(TSS200_mean,TSS1500_mean,body_mean,
+                                   exon1_mean,UTR3_mean,UTR5_mean),
+                          lower = c(TSS200_lower,TSS1500_lower,body_lower,
+                                    exon1_lower,UTR3_lower,UTR5_lower),
+                          upper = c(TSS200_upper,TSS1500_upper,body_upper,
+                                    exon1_upper,UTR3_upper,UTR5_upper),
+                          pollutant = "PM[2.5]")
+## reverses the factor level ordering for labels
+df_region_relation_exp$label <- factor(df_region_relation_exp$label,
+                            levels=rev(df_region_relation_exp$label))
+forest_plot_genes_pm <- ggplot(data=df_region_relation_exp, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red",
+                                    "orange"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h PM"[2.5]* " Exposure")) +
+  ylab(expression(paste(Delta,beta, " per ", mu, "g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-1.2e-7,1.2e-7)) +
+  theme(
+    legend.position = "none")
+
+##---------------------------------------------------------------------------
+
+  ## NO2 24 h exposure
+
+## The genomic regions we are observing here are TSS1500,Body, 3'UTR, 5'UTR,
+## TSS200, 
+TSS200_df <- df_no2[grepl("TSS200",df_no2$UCSC_RefGene_Group),]
+TSS200_ttest <- t.test(TSS200_df$estimate, mu = 0)
+TSS200_mean <- mean(TSS200_df$estimate)
+TSS200_lower <- TSS200_ttest$conf.int[1]
+TSS200_upper <- TSS200_ttest$conf.int[2]
+
+TSS1500_df <- df_no2[grepl("TSS1500",df_no2$UCSC_RefGene_Group),]
+TSS1500_ttest <- t.test(TSS1500_df$estimate, mu = 0)
+TSS1500_mean <- mean(TSS1500_df$estimate)
+TSS1500_lower <- TSS1500_ttest$conf.int[1]
+TSS1500_upper <- TSS1500_ttest$conf.int[2]
+
+exon1_df <- df_no2[grepl("1stExon",df_no2$UCSC_RefGene_Group),]
+exon1_ttest <- t.test(exon1_df$estimate, mu = 0)
+exon1_mean <- mean(exon1_df$estimate)
+exon1_lower <- exon1_ttest$conf.int[1]
+exon1_upper <- exon1_ttest$conf.int[2]
+
+body_df <- df_no2[grepl("Body",df_no2$UCSC_RefGene_Group),]
+body_ttest <- t.test(body_df$estimate, mu = 0)
+body_mean <- mean(body_df$estimate)
+body_lower <- body_ttest$conf.int[1]
+body_upper <- body_ttest$conf.int[2]
+
+UTR3_df <- df_no2[grepl("3'UTR",df_no2$UCSC_RefGene_Group),]
+UTR3_ttest <- t.test(UTR3_df$estimate, mu = 0)
+UTR3_mean <- mean(UTR3_df$estimate)
+UTR3_lower <- UTR3_ttest$conf.int[1]
+UTR3_upper <- UTR3_ttest$conf.int[2]
+
+UTR5_df <- df_no2[grepl("5'UTR",df_no2$UCSC_RefGene_Group),]
+UTR5_ttest <- t.test(UTR5_df$estimate, mu = 0)
+UTR5_mean <- mean(UTR5_df$estimate)
+UTR5_lower <- UTR5_ttest$conf.int[1]
+UTR5_upper <- UTR5_ttest$conf.int[2]
+
+
+
+df_region_relation_no2 <- data.frame(label = c("TSS200","TSS1500","Body", "1stExon",
+                                    "3'UTR","5'UTR"),
+                          mean = c(TSS200_mean,TSS1500_mean,body_mean,
+                                   exon1_mean,UTR3_mean,UTR5_mean),
+                          lower = c(TSS200_lower,TSS1500_lower,body_lower,
+                                    exon1_lower,UTR3_lower,UTR5_lower),
+                          upper = c(TSS200_upper,TSS1500_upper,body_upper,
+                                    exon1_upper,UTR3_upper,UTR5_upper),
+                          pollutant = "NO[2]")
+## reverses the factor level ordering for labels
+df_region_relation_no2$label <- factor(df_region_relation_no2$label,
+                            levels=rev(df_region_relation_no2$label))
+forest_plot_genes_no2 <- ggplot(data=df_region_relation_no2, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red",
+                                    "orange"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h NO"[2]* " Exposure")) +
+  ylab(expression(paste(Delta,beta, " per ", mu, "g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-7.5e-5,7.5e-5)) +
+  theme(
+    legend.position = "none")
+
+##----------------------------------------------------------------------------
+
+  ## O3 24 h Exposure
+
+## The genomic regions we are observing here are TSS1500,Body, 3'UTR, 5'UTR,
+## TSS200, 
+TSS200_df <- df_o3[grepl("TSS200",df_o3$UCSC_RefGene_Group),]
+TSS200_ttest <- t.test(TSS200_df$estimate, mu = 0)
+TSS200_mean <- mean(TSS200_df$estimate)
+TSS200_lower <- TSS200_ttest$conf.int[1]
+TSS200_upper <- TSS200_ttest$conf.int[2]
+
+TSS1500_df <- df_o3[grepl("TSS1500",df_o3$UCSC_RefGene_Group),]
+TSS1500_ttest <- t.test(TSS1500_df$estimate, mu = 0)
+TSS1500_mean <- mean(TSS1500_df$estimate)
+TSS1500_lower <- TSS1500_ttest$conf.int[1]
+TSS1500_upper <- TSS1500_ttest$conf.int[2]
+
+exon1_df <- df_o3[grepl("1stExon",df_o3$UCSC_RefGene_Group),]
+exon1_ttest <- t.test(exon1_df$estimate, mu = 0)
+exon1_mean <- mean(exon1_df$estimate)
+exon1_lower <- exon1_ttest$conf.int[1]
+exon1_upper <- exon1_ttest$conf.int[2]
+
+body_df <- df_o3[grepl("Body",df_o3$UCSC_RefGene_Group),]
+body_ttest <- t.test(body_df$estimate, mu = 0)
+body_mean <- mean(body_df$estimate)
+body_lower <- body_ttest$conf.int[1]
+body_upper <- body_ttest$conf.int[2]
+
+UTR3_df <- df_o3[grepl("3'UTR",df_o3$UCSC_RefGene_Group),]
+UTR3_ttest <- t.test(UTR3_df$estimate, mu = 0)
+UTR3_mean <- mean(UTR3_df$estimate)
+UTR3_lower <- UTR3_ttest$conf.int[1]
+UTR3_upper <- UTR3_ttest$conf.int[2]
+
+UTR5_df <- df_o3[grepl("5'UTR",df_o3$UCSC_RefGene_Group),]
+UTR5_ttest <- t.test(UTR5_df$estimate, mu = 0)
+UTR5_mean <- mean(UTR5_df$estimate)
+UTR5_lower <- UTR5_ttest$conf.int[1]
+UTR5_upper <- UTR5_ttest$conf.int[2]
+
+
+
+df_region_relation_o3 <- data.frame(label = c("TSS200","TSS1500","Body", "1stExon",
+                                    "3'UTR","5'UTR"),
+                          mean = c(TSS200_mean,TSS1500_mean,body_mean,
+                                   exon1_mean,UTR3_mean,UTR5_mean),
+                          lower = c(TSS200_lower,TSS1500_lower,body_lower,
+                                    exon1_lower,UTR3_lower,UTR5_lower),
+                          upper = c(TSS200_upper,TSS1500_upper,body_upper,
+                                    exon1_upper,UTR3_upper,UTR5_upper),
+                          pollutant = "O[3]")
+## reverses the factor level ordering for labels
+df_region_relation_o3$label <- factor(df_region_relation_o3$label,
+                            levels=rev(df_region_relation_o3$label))
+forest_plot_genes_o3 <- ggplot(data=df_region_relation_o3, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red",
+                                    "orange"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h O"[3]* " Exposure")) +
+  ylab(expression(paste(Delta,beta, " per ", mu, "g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-7.5e-5,7.5e-5)) +
+  theme(
+    legend.position = "none")
+
+##---------------------------------------------------------------------------
+
+  ## SO2 24 h exposure
+## The genomic regions we are observing here are TSS1500,Body, 3'UTR, 5'UTR,
+## TSS200, 
+
+TSS200_df <- df_so2[grepl("TSS200",df_so2$UCSC_RefGene_Group),]
+TSS200_ttest <- t.test(TSS200_df$estimate, mu = 0)
+TSS200_mean <- mean(TSS200_df$estimate)
+TSS200_lower <- TSS200_ttest$conf.int[1]
+TSS200_upper <- TSS200_ttest$conf.int[2]
+
+TSS1500_df <- df_so2[grepl("TSS1500",df_so2$UCSC_RefGene_Group),]
+TSS1500_ttest <- t.test(TSS1500_df$estimate, mu = 0)
+TSS1500_mean <- mean(TSS1500_df$estimate)
+TSS1500_lower <- TSS1500_ttest$conf.int[1]
+TSS1500_upper <- TSS1500_ttest$conf.int[2]
+
+exon1_df <- df_so2[grepl("1stExon",df_so2$UCSC_RefGene_Group),]
+exon1_ttest <- t.test(exon1_df$estimate, mu = 0)
+exon1_mean <- mean(exon1_df$estimate)
+exon1_lower <- exon1_ttest$conf.int[1]
+exon1_upper <- exon1_ttest$conf.int[2]
+
+body_df <- df_so2[grepl("Body",df_so2$UCSC_RefGene_Group),]
+body_ttest <- t.test(body_df$estimate, mu = 0)
+body_mean <- mean(body_df$estimate)
+body_lower <- body_ttest$conf.int[1]
+body_upper <- body_ttest$conf.int[2]
+
+UTR3_df <- df_so2[grepl("3'UTR",df_so2$UCSC_RefGene_Group),]
+UTR3_ttest <- t.test(UTR3_df$estimate, mu = 0)
+UTR3_mean <- mean(UTR3_df$estimate)
+UTR3_lower <- UTR3_ttest$conf.int[1]
+UTR3_upper <- UTR3_ttest$conf.int[2]
+
+UTR5_df <- df_so2[grepl("5'UTR",df_so2$UCSC_RefGene_Group),]
+UTR5_ttest <- t.test(UTR5_df$estimate, mu = 0)
+UTR5_mean <- mean(UTR5_df$estimate)
+UTR5_lower <- UTR5_ttest$conf.int[1]
+UTR5_upper <- UTR5_ttest$conf.int[2]
+
+
+
+df_region_relation_so2 <- data.frame(label = c("TSS200","TSS1500","Body", "1stExon",
+                                    "3'UTR","5'UTR"),
+                          mean = c(TSS200_mean,TSS1500_mean,body_mean,
+                                   exon1_mean,UTR3_mean,UTR5_mean),
+                          lower = c(TSS200_lower,TSS1500_lower,body_lower,
+                                    exon1_lower,UTR3_lower,UTR5_lower),
+                          upper = c(TSS200_upper,TSS1500_upper,body_upper,
+                                    exon1_upper,UTR3_upper,UTR5_upper),
+                          pollutant = "SO[2]")
+## reverses the factor level ordering for labels
+df_region_relation_so2$label <- factor(df_region_relation_so2$label,
+                            levels=rev(df_region_relation_so2$label))
+forest_plot_genes_so2 <- ggplot(data=df_region_relation_so2, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4",
+                                    "red",
+                                    "orange"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h SO"[2]* " Exposure")) +
+  ylab(expression(paste(Delta,beta, " per ", mu, "g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-0.01,0.01)) +
+  theme(legend.position = "none")
+```
+  ### Islands and shores in Gene structure related regions - forest plot
+```{r}
+## Multi-pollutant
+
+## Multipollutant Methylation Patterns
+## https://stackoverflow.com/questions/38062650/forest-plot-for-a-beginner-simple-example-using-ggplot2-edited
+
+## The genomic regions we are observing here are islands in gene bodies 
+island_body_df <- df_mp[grepl("Body",df_mp$UCSC_RefGene_Group) &
+                          grepl("Island", df_mp$Relation_to_Island),]
+island_body_ttest <- t.test(island_body_df$estimate, mu = 0)
+island_body_mean <- mean(island_body_df$estimate)
+island_body_lower <- island_body_ttest$conf.int[1]
+island_body_upper <- island_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+island_promoter_df <- df_mp[((grepl("TSS200",df_mp$UCSC_RefGene_Group)|
+                                grepl("5'UTR",df_mp$UCSC_RefGene_Group)) &
+                              grepl("Island", df_mp$Relation_to_Island)),]
+island_promoter_ttest <- t.test(island_promoter_df$estimate, mu = 0)
+island_promoter_mean <- mean(island_promoter_df$estimate)
+island_promoter_lower <- island_promoter_ttest$conf.int[1]
+island_promoter_upper <- island_promoter_ttest$conf.int[2]
+
+## The genomic regions we are observing here are islands in gene bodies 
+shore_body_df <- df_mp[grepl("Body",df_mp$UCSC_RefGene_Group) &
+                          grepl("Shore", df_mp$Relation_to_Island),]
+shore_body_ttest <- t.test(shore_body_df$estimate, mu = 0)
+shore_body_mean <- mean(shore_body_df$estimate)
+shore_body_lower <- shore_body_ttest$conf.int[1]
+shore_body_upper <- shore_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+shore_promoter_df <- df_mp[((grepl("TSS200",df_mp$UCSC_RefGene_Group)|
+                                grepl("5'UTR",df_mp$UCSC_RefGene_Group)) &
+                              grepl("Shore", df_mp$Relation_to_Island)),]
+shore_promoter_ttest <- t.test(shore_promoter_df$estimate, mu = 0)
+shore_promoter_mean <- mean(shore_promoter_df$estimate)
+shore_promoter_lower <- shore_promoter_ttest$conf.int[1]
+shore_promoter_upper <- shore_promoter_ttest$conf.int[2]
+
+
+
+cpg_gene_regions_mp <- data.frame(label = c("Islands in gene bodies",
+                                               "Islands in promoters",
+                                               "Shores in gene bodies",
+                                               "Shores in promoters"),
+                          mean = c(island_body_mean,island_promoter_mean,
+                                   shore_body_mean,
+                                   shore_promoter_mean),
+                          lower = c(island_body_lower,island_promoter_lower
+                                    ,shore_body_lower,
+                                    shore_promoter_lower),
+                          upper = c(island_body_upper,island_promoter_upper,
+                                    shore_body_upper,
+                                    shore_promoter_upper),
+                          pollutant = "Multi-pollutant")
+## reverses the factor level ordering for labels
+cpg_gene_regions_mp$label <- factor(cpg_gene_regions_mp$label,
+                            levels=rev(cpg_gene_regions_mp$label))
+forest_plots_cpg_gene_regions_mp <- ggplot(data=cpg_gene_regions_mp, aes(x=label, y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle("3 Year Ambient Multi-pollutant Exposure") +
+  ylab(expression(paste(Delta,beta," per indicator unit"))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-0.00016,0.00016)) +
+  theme(legend.position = "none",
+        axis.text.y = element_text(size = 8))
+
+##---------------------------------------------------------------------------
+## PM2.5
+
+## PM2.5 Methylation Patterns
+## https://stackoverflow.com/questions/38062650/forest-plot-for-a-beginner-simple-example-using-ggplot2-edited
+
+## The genomic regions we are observing here are islands in gene bodies 
+island_body_df <- df_exp[grepl("Body",df_exp$UCSC_RefGene_Group) &
+                          grepl("Island", df_exp$Relation_to_Island),]
+island_body_ttest <- t.test(island_body_df$estimate, mu = 0)
+island_body_mean <- mean(island_body_df$estimate)
+island_body_lower <- island_body_ttest$conf.int[1]
+island_body_upper <- island_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+island_promoter_df <- df_exp[((grepl("TSS200",df_exp$UCSC_RefGene_Group)|
+                                grepl("5'UTR",df_exp$UCSC_RefGene_Group)) &
+                              grepl("Island", df_exp$Relation_to_Island)),]
+island_promoter_ttest <- t.test(island_promoter_df$estimate, mu = 0)
+island_promoter_mean <- mean(island_promoter_df$estimate)
+island_promoter_lower <- island_promoter_ttest$conf.int[1]
+island_promoter_upper <- island_promoter_ttest$conf.int[2]
+
+## The genomic regions we are observing here are islands in gene bodies 
+shore_body_df <- df_exp[grepl("Body",df_exp$UCSC_RefGene_Group) &
+                          grepl("Shore", df_exp$Relation_to_Island),]
+shore_body_ttest <- t.test(shore_body_df$estimate, mu = 0)
+shore_body_mean <- mean(shore_body_df$estimate)
+shore_body_lower <- shore_body_ttest$conf.int[1]
+shore_body_upper <- shore_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+shore_promoter_df <- df_exp[((grepl("TSS200",df_exp$UCSC_RefGene_Group)|
+                                grepl("5'UTR",df_exp$UCSC_RefGene_Group)) &
+                              grepl("Shore", df_exp$Relation_to_Island)),]
+shore_promoter_ttest <- t.test(shore_promoter_df$estimate, mu = 0)
+shore_promoter_mean <- mean(shore_promoter_df$estimate)
+shore_promoter_lower <- shore_promoter_ttest$conf.int[1]
+shore_promoter_upper <- shore_promoter_ttest$conf.int[2]
+
+
+
+cpg_gene_regions_exp <- data.frame(label = c("Islands in gene bodies",
+                                               "Islands in promoters",
+                                               "Shores in gene bodies",
+                                               "Shores in promoters"),
+                          mean = c(island_body_mean,island_promoter_mean,
+                                   shore_body_mean,
+                                   shore_promoter_mean),
+                          lower = c(island_body_lower,island_promoter_lower
+                                    ,shore_body_lower,
+                                    shore_promoter_lower),
+                          upper = c(island_body_upper,island_promoter_upper,
+                                    shore_body_upper,
+                                    shore_promoter_upper),
+                          pollutant = "PM[2.5]")
+## reverses the factor level ordering for labels
+cpg_gene_regions_exp$label <- factor(cpg_gene_regions_exp$label,
+                            levels=rev(cpg_gene_regions_exp$label))
+forest_plots_cpg_gene_regions_exp<- ggplot(data=cpg_gene_regions_exp,
+                                           aes(x=label, 
+                                               y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h PM"[2.5]* " Exposure")) +
+  ylab(expression(paste(Delta, beta, " per ", mu,"g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-3e-7,3e-7)) +
+  theme(
+    legend.position = "none")
+
+##---------------------------------------------------------------------------
+## NO2
+
+## NO2 Methylation Patterns
+## https://stackoverflow.com/questions/38062650/forest-plot-for-a-beginner-simple-example-using-ggplot2-edited
+
+## The genomic regions we are observing here are islands in gene bodies 
+island_body_df <- df_no2[grepl("Body",df_no2$UCSC_RefGene_Group) &
+                          grepl("Island", df_no2$Relation_to_Island),]
+island_body_ttest <- t.test(island_body_df$estimate, mu = 0)
+island_body_mean <- mean(island_body_df$estimate)
+island_body_lower <- island_body_ttest$conf.int[1]
+island_body_upper <- island_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+island_promoter_df <- df_no2[((grepl("TSS200",df_no2$UCSC_RefGene_Group)|
+                                grepl("5'UTR",df_no2$UCSC_RefGene_Group)) &
+                              grepl("Island", df_no2$Relation_to_Island)),]
+island_promoter_ttest <- t.test(island_promoter_df$estimate, mu = 0)
+island_promoter_mean <- mean(island_promoter_df$estimate)
+island_promoter_lower <- island_promoter_ttest$conf.int[1]
+island_promoter_upper <- island_promoter_ttest$conf.int[2]
+
+## The genomic regions we are observing here are islands in gene bodies 
+shore_body_df <- df_no2[grepl("Body",df_no2$UCSC_RefGene_Group) &
+                          grepl("Shore", df_no2$Relation_to_Island),]
+shore_body_ttest <- t.test(shore_body_df$estimate, mu = 0)
+shore_body_mean <- mean(shore_body_df$estimate)
+shore_body_lower <- shore_body_ttest$conf.int[1]
+shore_body_upper <- shore_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+shore_promoter_df <- df_no2[((grepl("TSS200",df_no2$UCSC_RefGene_Group)|
+                                grepl("5'UTR",df_no2$UCSC_RefGene_Group)) &
+                              grepl("Shore", df_no2$Relation_to_Island)),]
+shore_promoter_ttest <- t.test(shore_promoter_df$estimate, mu = 0)
+shore_promoter_mean <- mean(shore_promoter_df$estimate)
+shore_promoter_lower <- shore_promoter_ttest$conf.int[1]
+shore_promoter_upper <- shore_promoter_ttest$conf.int[2]
+
+
+
+cpg_gene_regions_no2 <- data.frame(label = c("Islands in gene bodies",
+                                               "Islands in promoters",
+                                               "Shores in gene bodies",
+                                               "Shores in promoters"),
+                          mean = c(island_body_mean,island_promoter_mean,
+                                   shore_body_mean,
+                                   shore_promoter_mean),
+                          lower = c(island_body_lower,island_promoter_lower
+                                    ,shore_body_lower,
+                                    shore_promoter_lower),
+                          upper = c(island_body_upper,island_promoter_upper,
+                                    shore_body_upper,
+                                    shore_promoter_upper),
+                          pollutant = "NO[2]")
+## reverses the factor level ordering for labels
+cpg_gene_regions_no2$label <- factor(cpg_gene_regions_no2$label,
+                            levels=rev(cpg_gene_regions_no2$label))
+forest_plots_cpg_gene_regions_no2<- ggplot(data=cpg_gene_regions_no2,
+                                           aes(x=label, 
+                                               y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h NO"[2]* " Exposure")) +
+  ylab(expression(paste(Delta, beta, " per ", mu,"g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-1.3e-4,1.3e-4)) +
+  theme(
+    legend.position = "none")
+
+##---------------------------------------------------------------------------
+## O3 
+## The genomic regions we are observing here are islands in gene bodies 
+island_body_df <- df_o3[grepl("Body",df_o3$UCSC_RefGene_Group) &
+                          grepl("Island", df_o3$Relation_to_Island),]
+island_body_ttest <- t.test(island_body_df$estimate, mu = 0)
+island_body_mean <- mean(island_body_df$estimate)
+island_body_lower <- island_body_ttest$conf.int[1]
+island_body_upper <- island_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+island_promoter_df <- df_o3[((grepl("TSS200",df_o3$UCSC_RefGene_Group)|
+                                grepl("5'UTR",df_o3$UCSC_RefGene_Group)) &
+                              grepl("Island", df_o3$Relation_to_Island)),]
+island_promoter_ttest <- t.test(island_promoter_df$estimate, mu = 0)
+island_promoter_mean <- mean(island_promoter_df$estimate)
+island_promoter_lower <- island_promoter_ttest$conf.int[1]
+island_promoter_upper <- island_promoter_ttest$conf.int[2]
+
+## The genomic regions we are observing here are islands in gene bodies 
+shore_body_df <- df_o3[grepl("Body",df_o3$UCSC_RefGene_Group) &
+                          grepl("Shore", df_o3$Relation_to_Island),]
+shore_body_ttest <- t.test(shore_body_df$estimate, mu = 0)
+shore_body_mean <- mean(shore_body_df$estimate)
+shore_body_lower <- shore_body_ttest$conf.int[1]
+shore_body_upper <- shore_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+shore_promoter_df <- df_o3[((grepl("TSS200",df_o3$UCSC_RefGene_Group)|
+                                grepl("5'UTR",df_o3$UCSC_RefGene_Group)) &
+                              grepl("Shore", df_o3$Relation_to_Island)),]
+shore_promoter_ttest <- t.test(shore_promoter_df$estimate, mu = 0)
+shore_promoter_mean <- mean(shore_promoter_df$estimate)
+shore_promoter_lower <- shore_promoter_ttest$conf.int[1]
+shore_promoter_upper <- shore_promoter_ttest$conf.int[2]
+
+
+
+cpg_gene_regions_o3 <- data.frame(label = c("Islands in gene bodies",
+                                               "Islands in promoters",
+                                               "Shores in gene bodies",
+                                               "Shores in promoters"),
+                          mean = c(island_body_mean,island_promoter_mean,
+                                   shore_body_mean,
+                                   shore_promoter_mean),
+                          lower = c(island_body_lower,island_promoter_lower
+                                    ,shore_body_lower,
+                                    shore_promoter_lower),
+                          upper = c(island_body_upper,island_promoter_upper,
+                                    shore_body_upper,
+                                    shore_promoter_upper),
+                          pollutant = "O[3]")
+## reverses the factor level ordering for labels
+cpg_gene_regions_o3$label <- factor(cpg_gene_regions_o3$label,
+                            levels=rev(cpg_gene_regions_o3$label))
+forest_plots_cpg_gene_regions_o3<- ggplot(data=cpg_gene_regions_o3,
+                                           aes(x=label, 
+                                               y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h O"[3]* " Exposure")) +
+  ylab(expression(paste(Delta, beta, " per ", mu,"g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-8e-5,8e-5)) +
+  theme(
+    legend.position = "none")
+
+##---------------------------------------------------------------------------
+## SO2
+## The genomic regions we are observing here are islands in gene bodies 
+island_body_df <- df_so2[grepl("Body",df_so2$UCSC_RefGene_Group) &
+                          grepl("Island", df_so2$Relation_to_Island),]
+island_body_ttest <- t.test(island_body_df$estimate, mu = 0)
+island_body_mean <- mean(island_body_df$estimate)
+island_body_lower <- island_body_ttest$conf.int[1]
+island_body_upper <- island_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+island_promoter_df <- df_so2[(grepl("TSS200",df_so2$UCSC_RefGene_Group) |
+                              grepl("5'UTR", df_so2$UCSC_RefGene_Group)) &
+                              grepl("Island", df_so2$Relation_to_Island),]
+island_promoter_ttest <- t.test(island_promoter_df$estimate, mu = 0)
+island_promoter_mean <- mean(island_promoter_df$estimate)
+island_promoter_lower <- island_promoter_ttest$conf.int[1]
+island_promoter_upper <- island_promoter_ttest$conf.int[2]
+
+## The genomic regions we are observing here are islands in gene bodies 
+shore_body_df <- df_so2[grepl("Body",df_so2$UCSC_RefGene_Group) &
+                          grepl("Shore", df_so2$Relation_to_Island),]
+shore_body_ttest <- t.test(shore_body_df$estimate, mu = 0)
+shore_body_mean <- mean(shore_body_df$estimate)
+shore_body_lower <- shore_body_ttest$conf.int[1]
+shore_body_upper <- shore_body_ttest$conf.int[2]
+
+## CpG islands in gene promoters
+shore_promoter_df <- df_so2[((grepl("TSS200",df_so2$UCSC_RefGene_Group)|
+                                grepl("5'UTR",df_so2$UCSC_RefGene_Group)) &
+                              grepl("Shore", df_so2$Relation_to_Island)),]
+shore_promoter_ttest <- t.test(shore_promoter_df$estimate, mu = 0)
+shore_promoter_mean <- mean(shore_promoter_df$estimate)
+shore_promoter_lower <- shore_promoter_ttest$conf.int[1]
+shore_promoter_upper <- shore_promoter_ttest$conf.int[2]
+
+
+
+cpg_gene_regions_so2 <- data.frame(label = c("Islands in gene bodies",
+                                               "Islands in promoters",
+                                               "Shores in gene bodies",
+                                               "Shores in promoters"),
+                          mean = c(island_body_mean,island_promoter_mean,
+                                   shore_body_mean,
+                                   shore_promoter_mean),
+                          lower = c(island_body_lower,island_promoter_lower
+                                    ,shore_body_lower,
+                                    shore_promoter_lower),
+                          upper = c(island_body_upper,island_promoter_upper,
+                                    shore_body_upper,
+                                    shore_promoter_upper),
+                          pollutant = "SO[2]")
+## reverses the factor level ordering for labels
+cpg_gene_regions_so2$label <- factor(cpg_gene_regions_so2$label,
+                            levels=rev(cpg_gene_regions_so2$label))
+forest_plots_cpg_gene_regions_so2<- ggplot(data=cpg_gene_regions_so2,
+                                           aes(x=label, 
+                                               y= mean,
+                                            ymin = lower,
+                                            ymax = upper)) +
+  geom_pointrange(aes(color=as.factor(label))) +
+  scale_color_manual(values = rep(c("#6A0DAD",
+                                    "#28A745",
+                                    "#1E90FF",
+                                    "#FF69B4"))) +
+  geom_hline(yintercept=0, lty =2) +
+  coord_flip() +
+  ggtitle(expression("24 h SO"[2]* " Exposure")) +
+  ylab(expression(paste(Delta, beta, " per ", mu,"g/m"^3))) +
+  xlab("Region") +
+  scale_y_continuous(limits = c(-0.015, 0.015)) +
+  theme(
+    legend.position = "none")
+```
+  
+  
+## **Aim 3:** Enrichment Analysis
+  ### GO and KEGG gene sets
+```{r}
+## Multi-pollutant
+
+## https://bioconductor.org/packages/devel/bioc/vignettes/methylGSA/inst/doc/methylGSA-vignette.html#description-of-methylglm
+
+
+## ---------------------------------------------------------------------------
+## Multipollutant Pathway analysis
+pa_df_mp <- df_mp[df_mp$p.value <= 0.0001]
+rownames(pa_df_mp) <- pa_df_mp$probe_id
+df_vector_mp <-  pa_df_mp$p.value
+names(df_vector_mp) <- pa_df_mp$probe_id
+
+res3 = methylglm(cpg.pval= df_vector_mp, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "KEGG") %>%
+  mutate(., pollutant = "Multi-pollutant")
+res4 = methylglm(cpg.pval= df_vector_mp, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "GO") %>%
+  mutate(., pollutant = "Multi-pollutant")
+
+
+barplot(res3, num = 8, colorby = "pvalue")
+barplot(res4, num = 8, colorby = "pvalue")
+
+## KEGG plot that has a gradient for colours
+# mp_barplot_kegg <- ggplot(res3, aes(x=Description, y=Size, fill = padj)) +
+#   geom_bar(stat = "identity") +
+#   scale_fill_gradient(high = "#434475FF", low = "#89AB7CFF", na.value = NA)+
+#   ggtitle("KEGG Gene Sets Associated with Multi-pollutant Exposure") +
+#   xlab("") +
+#   ylab("Size of the Gene Set") +
+#   coord_flip()
+
+
+mp_barplot_kegg <- ggplot(res3[c(1:5),], aes(x=Description, y=Size, fill = padj < 0.05,
+                                    width = 0.85)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF")) +
+  ggtitle("KEGG Sets Associated with Multi-pollutants")+
+  xlab("") +
+  ylab("Size of Gene Set") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 12),
+        title = element_text(size = 12))
+
+mp_barplot_go <- res4[c(1:10),] %>%
+  ggplot(aes(x=Description, y=Size, fill = padj < 0.05,
+                                    width = 0.85)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF")) +
+  ggtitle("GO Sets Associated with Multi-pollutants")+
+  xlab("")+
+  ylab("Size of Gene Set") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 12),
+        title = element_text(size = 12))
+
+##-----------------------------------------------------------------------------
+
+## PM2.5
+
+## 24 hour PM25 Exposure Pathway Analysis
+pa_df_exp <- df_exp[df_exp$p.value <= 0.0001]
+rownames(pa_df_exp) <- pa_df_exp$probe_id
+df_vector_exp <-  pa_df_exp$p.value
+names(df_vector_exp) <- pa_df_exp$probe_id
+
+res5 = methylglm(cpg.pval= df_vector_exp, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "KEGG") %>%
+  mutate(., pollutant =  "PM[2.5]")
+res6 = methylglm(cpg.pval= df_vector_exp, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "GO") %>%
+  mutate(., pollutant = "PM[2.5]")
+  res6$Description[res6$ID == "GO:0006890"] <- "retrograde vesicle-mediated transport, \n Golgi to endoplasmic reticulum"
+  res6$Description[res6$ID == "GO:0004553"] <- "hydrolase activity, \n hydrolyzing O-glycosyl compounds"
+  res6$Description[res6$ID == "GO:0016798"] <- "hydrolase activity, \n acting on glycosyl bonds"
+
+	
+
+
+ barplot(res5, num = 8, colorby = "pvalue")
+ barplot(res6, num = 8, colorby = "pvalue")
+
+exp_barplot_kegg <- res5[c(1:10),] %>%
+  ggplot( aes(x=Description, y=Size,
+                                     fill = padj < 0.05, width = 0.85)) +
+  geom_bar(stat = "identity") +
+  ## VanGogh1 
+  ## paletteer_d("MetBrewer::VanGogh1")
+  #scale_fill_gradient(high = "#434475FF", low = "#89AB7CFF", na.value = NA
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF" )) +
+  # scale_fill_gradient(low = "blue", high = "red", na.value = NA) +
+  ggtitle(expression("KEGG Gene Sets Associated with PM"[2.5]* " Exposure")) +
+  xlab("")+
+  ylab("Size of the Gene Set") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 12),
+        title = element_text(size = 12))
+
+exp_barplot_go <- res6[c(1:10),] %>%
+  ggplot( aes(x=Description, y=Size, fill = padj < 0.05)) + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF" )) +
+  ggtitle(expression("GO Sets Associated with PM"[2.5]* " Exposure")) +
+  xlab("") +
+  ylab("Size of the Gene Set") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 12),
+        title = element_text(size = 12))
+
+##----------------------------------------------------------------------------
+
+## NO2
+
+## 24 hour no2 Exposure Pathway Analysis
+pa_df_no2 <- df_no2[df_no2$p.value <= 0.0001]
+rownames(pa_df_no2) <- pa_df_no2$probe_id
+df_vector_no2 <-  pa_df_no2$p.value
+names(df_vector_no2) <- pa_df_no2$probe_id
+
+res9 = methylglm(cpg.pval= df_vector_no2, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "KEGG") %>%
+  mutate(., pollutant = "NO[2]")
+res10 = methylglm(cpg.pval= df_vector_no2, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "GO") %>%
+  mutate(., pollutant = "NO[2]")
+
+
+ # barplot(res9, num = 8, colorby = "pvalue")
+ # barplot(re10, num = 8, colorby = "pvalue")
+
+no2_barplot_kegg <- ggplot(res9, aes(x=Description, y=Size, fill = padj < 0.05,
+                                    width = 0.85)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF" )) +
+  #Title and axis:
+  ggtitle(expression("KEGG Gene Set Associated with NO"[2]* " Exposure")) +
+  xlab("") +
+  ylab("Size of the Gene Set") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 12))
+
+no2_barplot_go <- 
+  res10[c(1:10),] %>%
+  ggplot( aes(x=Description, y=Size, fill = padj < 0.05)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF" )) +
+  ggtitle(expression("GO Sets Associated with NO"[2]* " Exposure")) +
+  ylab("Size of the Gene Set") +
+  xlab("") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 12),
+        title = element_text(size = 12))
+
+## -------------------------------------------------------------------------
+
+## O3
+
+## 24 hour O3 Exposure Pathway Analysis
+pa_df_o3 <- df_o3[df_o3$p.value <= 0.0001]
+rownames(pa_df_o3) <- pa_df_o3$probe_id
+df_vector_o3 <-  pa_df_o3$p.value
+names(df_vector_o3) <- pa_df_o3$probe_id
+
+res7 = methylglm(cpg.pval= df_vector_o3, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "KEGG")%>%
+  mutate(., pollutant = "O[3]")
+res8 = methylglm(cpg.pval= df_vector_o3, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "GO") %>%
+  mutate(., pollutant = "O[3]")
+
+
+ # barplot(res7, num = 8, colorby = "pvalue")
+ # barplot(res8, num = 8, colorby = "pvalue")
+
+o3_barplot_kegg <- ggplot(res7, aes(x=Description, y=Size, fill = padj < 0.05,
+                                    width = 0.85)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF" )) +
+  ggtitle(expression("KEGG Gene Set Associated with O"[3]* " Exposure")) +
+  ylab("Size of the Gene Set") +
+  xlab("") +
+  coord_flip() + 
+  theme(axis.text.y = element_text(size = 12))
+
+o3_barplot_go <- 
+  res8[c(1:10),] %>%
+  ggplot( aes(x=Description, y=Size, fill = padj < 0.05)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF" )) +
+  ggtitle(expression("GO Sets Associated with O"[3]* "Exposure")) +
+  ylab("Size of the Gene Set") +
+  xlab("") +
+  coord_flip() + 
+  theme(axis.text.y = element_text(size = 12),
+        title = element_text(size = 12))
+
+## -------------------------------------------------------------------------
+
+## SO2
+
+## 24 hour so2 Exposure Pathway Analysis
+pa_df_so2 <- df_so2[df_so2$p.value <= 0.0001]
+rownames(pa_df_so2) <- pa_df_so2$probe_id
+df_vector_so2 <-  pa_df_so2$p.value
+names(df_vector_so2) <- pa_df_so2$probe_id
+
+res11 = methylglm(cpg.pval= df_vector_so2, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "KEGG") %>%
+  mutate(., pollutant = "SO[2]")
+res12 = methylglm(cpg.pval= df_vector_so2, array.type = "EPIC", minsize = 50,
+                 maxsize = 500, GS.type = "GO") %>%
+  mutate(., pollutant = "SO[2]")
+
+
+ # barplot(res11, num = 8, colorby = "pvalue")
+ # barplot(re12, num = 8, colorby = "pvalue")
+
+so2_barplot_kegg <- ggplot(res11[c(1:4),], aes(x=Description, y=Size, fill = padj < 0.05,
+                                      width = 0.85)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF" )) +
+  ggtitle(expression("KEGG Gene Set Associated with SO"[2]* " Exposure")) +
+  ylab("Size of the Gene Set") +
+  xlab("") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 12))
+
+so2_barplot_go <- 
+  res12[c(1:10),] %>%
+  ggplot( aes(x=Description, y=Size, fill = padj < 0.05)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("TRUE" = "#89AB7CFF", "FALSE" = "#434475FF" )) +
+  ggtitle(expression("GO Sets Associated with SO"[2]* " Exposure")) +
+  ylab("Size of the Gene Set") +
+  xlab("") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 12),
+        title = element_text(size = 12))
+
+```
+
+## Points to help with the discussion section
+```{r}
+
+pollomic <- fread("Methylation_dynamic_table.csv")
+
+pollomic_transcription <- fread("Transcript_dynamic_table.csv")
+
+## Multi-pollutant
+
+## MP with that have a FDR <= 0.5
+mp_poll_overlap <- df_significant_mp[df_significant_mp$probe_id %in%
+                                       pollomic$Probe_ID,] 
+
+##----------------------------------------------------------------------------
+
+## PM2.5
+
+## EXP with an FDR <= 0.5
+exp_poll_overlap <- df_significant_exp[df_significant_exp$probe_id %in%
+                                         pollomic$Probe_ID,]
+
+
+##  --------------------------------------------------------------------------
+
+## NO2 
+
+## NO2 with an FDR <= 0.5
+no2_poll_overlap <- df_significant_no2[df_significant_no2$probe_id %in%
+                                         pollomic$Probe_ID,]
+
+
+##----------------------------------------------------------------------------
+
+
+## O3 
+
+##
+o3_poll_overlap <- df_significant_o3[df_significant_o3$probe_id %in%
+                                         pollomic$Probe_ID,]
+
+## ----------------------------------------------------------------------------
+all_trend_cpgs <- rbind(df_significant_mp, df_significant_exp,
+                        df_significant_no2, df_significant_o3,
+                        df_significant_so2)
+
+overlap <- all_trend_cpgs[all_trend_cpgs$probe_id %in%
+                            pollomic$Probe_ID]
+
+
+```
+
+## Plots for thesis
+  ### CGI plots
+```{r}
+## Arrange forest plots into a single figure
+merged_forest_CGI_plots <- ggarrange(forest_plot_exp,
+                                          forest_plot_no2,
+                                          forest_plot_o3,
+                                          forest_plot_so2,
+                                          forest_plot_mp,
+                                          labels = c("A", "B", "C", "D", "E"),
+                                          ncol = 1, nrow = 5, 
+                                          heights = c(0.7))
+
+## for thesis 
+ggsave("thesis_forest_CGI_region_plots",
+       plot = merged_forest_CGI_plots,
+       device = "jpeg",
+       path = NULL,
+       scale = 1,
+       width = 6,
+       height = 7,
+       units = c("in"),
+       dpi = 300,
+       limitsize = TRUE,
+       bg = NULL,
+       create.dir = FALSE,)
+```
+
+  ### Gene structure-related forest plots
+```{r}
+## Arrange forest plots into a single figure
+merged_gene_forest_plots <- ggarrange(forest_plot_genes_pm,
+                                          forest_plot_genes_no2,
+                                          forest_plot_genes_o3,
+                                          forest_plot_genes_so2,
+                                          forest_plot_genes_mp,
+                                          labels = c("A", "B", "C", "D", "E"),
+                                          ncol = 1, nrow = 5, 
+                                          heights = c(0.7))
+
+## for thesis 
+ggsave("thesis_forest_gene_region_plots",
+       plot = merged_gene_forest_plots,
+       device = "jpeg",
+       path = NULL,
+       scale = 1,
+       width = 7.5,
+       height = 8.5,
+       units = c("in"),
+       dpi = 300,
+       limitsize = TRUE,
+       bg = NULL,
+       create.dir = FALSE,)
+```
+
+  ### CGIs in gene structured-related regions forest plots
+```{r}
+## Merged the individual Forest plots
+merged_cpg_gene_forest_plots <- ggarrange(forest_plots_cpg_gene_regions_exp,
+                                          forest_plots_cpg_gene_regions_no2,
+                                          forest_plots_cpg_gene_regions_o3,
+                                          forest_plots_cpg_gene_regions_so2,
+                                          forest_plots_cpg_gene_regions_mp,
+                                          labels = c("A", "B", "C", "D", "E"),
+                                          ncol = 1, nrow = 5, 
+                                          heights = c(0.7))
+
+## For thesis
+ggsave( "thesis_forest_cpg_gene_region_plots",
+        plot = merged_cpg_gene_forest_plots,
+        device = "jpeg",
+        path = NULL,
+        scale = 1,
+        width = 6,
+        height = 6.5,
+        units = c("in"),
+        dpi = 300,
+        limitsize = TRUE,
+        bg = NULL,
+        create.dir = FALSE,)
+```
+
+  ### Enrichment analysis
+```{r}
+##---------------------------------------------------------------------------
+## Separate figures for each GO set 
+ggsave(
+  "exp_barplot_go_thesis",
+  plot = exp_barplot_go,
+  device = "jpeg",
+  path = NULL,
+  scale = 1,
+  width = 8.5,
+  height = 5,
+  units = c("in"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL,
+  create.dir = FALSE,)
+
+ggsave(
+  "no2_barplot_go_thesis",
+  plot = no2_barplot_go,
+  device = "jpeg",
+  path = NULL,
+  scale = 1,
+  width = 8.5,
+  height = 5,
+  units = c("in"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL,
+  create.dir = FALSE,)
+
+ggsave(
+  "o3_barplot_go_thesis",
+  plot = o3_barplot_go,
+  device = "jpeg",
+  path = NULL,
+  scale = 1,
+  width = 8.5,
+  height = 5,
+  units = c("in"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL,
+  create.dir = FALSE,)
+
+ggsave(
+  "so2_barplot_go_thesis",
+  plot = so2_barplot_go,
+  device = "jpeg",
+  path = NULL,
+  scale = 1,
+  width = 8.5,
+  height = 5,
+  units = c("in"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL,
+  create.dir = FALSE,)
+
+ggsave(
+  "mp_barplot_go_thesis",
+  plot = mp_barplot_go,
+  device = "jpeg",
+  path = NULL,
+  scale = 1,
+  width = 8.5,
+  height = 5,
+  units = c("in"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL,
+  create.dir = FALSE,)
+
+##---------------------------------------------------------------------------
+merge_kegg <- rbind(res3, res5, res7,
+                    res9, res11)
+
+ggsave(
+  "thesis_so2_kegg",
+  plot = so2_barplot_kegg,
+  device = "jpeg",
+  path = NULL,
+  scale = 1,
+  width = 8.5,
+  height = 2.5,
+  units = c("in"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL,
+  create.dir = FALSE,)
+
+## multi-pollutant exposure
+ggsave(
+  "thesis_mp_kegg",
+  plot = mp_barplot_kegg,
+  device = "jpeg",
+  path = NULL,
+  scale = 1,
+  width = 8.5,
+  height = 2.5,
+  units = c("in"),
+  dpi = 300,
+  limitsize = TRUE,
+  bg = NULL,
+  create.dir = FALSE,)
+```
+
+
+
+
+
+
+
+
+
+
+
+

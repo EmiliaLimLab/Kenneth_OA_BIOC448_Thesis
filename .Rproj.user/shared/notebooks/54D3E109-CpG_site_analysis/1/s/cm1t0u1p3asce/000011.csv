@@ -1,0 +1,8 @@
+"0","merged_go_barplots <- ggarrange(exp_barplot_go, no2_barplot_go,
+                                o3_barplot_go, so2_barplot_go,
+                                mp_barplot_go,
+                                levels = c(""A"", ""B"", ""C"", ""D"", ""E""),
+                                ncol = 1, nrow = 5,
+                                heights = c(1))
+"
+"2","Warning: Cannot convert object of class character into a grob."

@@ -1,0 +1,25 @@
+"0","## Merged the individual Forest plots
+merged_cpg_gene_forest_plots <- ggarrange(forest_plots_cpg_gene_regions_exp,
+                                          forest_plots_cpg_gene_regions_no2,
+                                          forest_plots_cpg_gene_regions_o3,
+                                          forest_plots_cpg_gene_regions_so2,
+                                          forest_plots_cpg_gene_regions_mp,
+                                          labels = c(""A"", ""B"", ""C"", ""D"", ""E""),
+                                          ncol = 1, nrow = 5, 
+                                          heights = c(0.7))
+"
+"2","Warning: [38;5;254mRemoved 1 row containing missing values or values outside the scale range (`geom_segment()`).[39m"
+"0","## For thesis"
+"0","ggsave("
+"0","  ""thesis_forest_cpg_gene_region_plots"","
+"0","  plot = merged_cpg_gene_forest_plots,"
+"0","  device = ""jpeg"","
+"0","  path = NULL,"
+"0","  scale = 1,"
+"0","  width = 7.5,"
+"0","  height = 8.5,"
+"0","  units = c(""in""),"
+"0","  dpi = 300,"
+"0","  limitsize = TRUE,"
+"0","  bg = NULL,"
+"0","  create.dir = FALSE,"

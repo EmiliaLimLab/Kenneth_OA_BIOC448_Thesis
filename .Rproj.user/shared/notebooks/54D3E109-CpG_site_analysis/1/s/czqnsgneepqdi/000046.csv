@@ -1,0 +1,7 @@
+"0","pm_sum <- pm_pollomic %>%
+  distinct(Probe_ID, PMID, .keep_all = TRUE) %>%
+  group_by(Probe_ID) %>%  # Group by vehicle
+  summarise(unique_locations = n(), .groups = ""drop"") 
+"
+"2","Error: object 'pm_pollomic' not found
+"

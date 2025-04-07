@@ -1,0 +1,5 @@
+"0","  res6$Description[res6$ID == ""GO:0016798"",] <- ""hydrolase activity, \n acting on glycosyl bonds""
+"
+"2","Error in res6$Description[res6$ID == ""GO:0016798"", ] <- ""hydrolase activity, \n acting on glycosyl bonds"" : 
+  incorrect number of subscripts on matrix
+"

@@ -1,0 +1,7 @@
+"0",""
+"0","## 3 Year Ambient Multi-pollutant"
+"0","## write the subsets as a csv."
+"0","pollutant_glm(""aqaix12_01"",""mp_first_subset.csv"",""mp_second_subset.csv"","
+"0","              ""mp_third_subset.csv"",""mp_fourth_subset.csv"")"
+"2","Error in registerDoMC(25) : could not find function ""registerDoMC""
+"

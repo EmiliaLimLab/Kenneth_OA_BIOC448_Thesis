@@ -1,0 +1,6 @@
+"0","##Dilated cardiomyopathy
+genes_05414 <- AnnotationDbi::select(org.Hs.eg.db, ""05414"", ""SYMBOL"", keytype = ""PATH"")
+"
+"2","'select()' returned 1:many mapping between keys and columns
+"
+"0","mp_genes_05414 <- mp_genes[mp_genes %in% genes_05414$SYMBOL]"

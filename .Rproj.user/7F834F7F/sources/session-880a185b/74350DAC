@@ -1,0 +1,26 @@
+{
+    "id": "74350DAC",
+    "path": "~/Documents/Personal/School/2024_2025_Session/BIOC_448/Bioc_448_analysis_view_only/CpG_site_analysis.Rmd",
+    "project_path": "CpG_site_analysis.Rmd",
+    "type": "r_markdown",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1738103596771.0,
+    "source_on_save": false,
+    "relative_order": 1,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "3214,47",
+        "scrollLine": "3160"
+    },
+    "folds": "139|45|154|0|\n156|48|182|0|\n184|42|468|3|\n185|31|384|3|\n495|34|531|3|\n533|6|630|0|\n631|33|710|3|\n1030|6|1395|0|\n1398|6|1772|0|\n1775|6|2158|0|\n2410|6|2457|0|\n2511|21|2848|0|\n",
+    "lastKnownWriteTime": 1743993419,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1744000995794,
+    "read_only": false,
+    "read_only_alternatives": []
+}

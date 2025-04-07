@@ -1,0 +1,25 @@
+"0","## Arrange forest plots into a single figure
+merged_forest_CGI_plots <- ggarrange(forest_plot_exp,
+                                          forest_plot_no2,
+                                          forest_plot_o3,
+                                          forest_plot_so2,
+                                          forest_plot_mp,
+                                          labels = c(""A"", ""B"", ""C"", ""D"", ""E""),
+                                          ncol = 1, nrow = 5, 
+                                          heights = c(0.7))
+"
+"2","Warning: [38;5;254mRemoved 1 row containing missing values or values outside the scale range (`geom_segment()`).[39m"
+"2","Warning: [38;5;254mRemoved 1 row containing missing values or values outside the scale range (`geom_segment()`).[39m"
+"0","## for thesis "
+"0","ggsave(""thesis_forest_CGI_region_plots"","
+"0","       plot = merged_forest_CGI_plots,"
+"0","       device = ""jpeg"","
+"0","       path = NULL,"
+"0","       scale = 1,"
+"0","       width = 6,"
+"0","       height = 7,"
+"0","       units = c(""in""),"
+"0","       dpi = 300,"
+"0","       limitsize = TRUE,"
+"0","       bg = NULL,"
+"0","       create.dir = FALSE,)"
